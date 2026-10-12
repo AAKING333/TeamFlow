@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from app import create_app
@@ -18,7 +20,9 @@ def test_testing_configuration_is_loaded():
     application = create_app("testing")
 
     assert application.config["ENV"] == "testing"
-    assert "sqlite" in application.config["SQLALCHEMY_DATABASE_URI"]
+    assert application.config["SQLALCHEMY_DATABASE_URI"] == os.getenv(
+        "TEST_DATABASE_URL", "sqlite:///:memory:"
+    )
 
 
 def test_app_factory_uses_app_config_environment(monkeypatch):
