@@ -1,0 +1,119 @@
+name: Backend CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    env:
+      APP_CONFIG: testing
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-dev.txt
+
+      - name: Run Ruff lint checks
+        run: ruff check backend
+
+      - name: Check Ruff formatting
+        run: ruff format --check backend
+
+      - name: Run pytest
+        working-directory: backend
+        run: pytest tests
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      APP_CONFIG: development
+      DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_migration_check
+      TEST_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_test
+      MIGRATION_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_migration_check
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-dev.txt
+
+      - name: Wait for PostgreSQL and create disposable databases
+        run: |
+          for attempt in {1..30}; do
+            if pg_isready -h localhost -p 5432 -U postgres -d postgres; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "PostgreSQL did not become ready." >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          psql "postgresql://postgres@localhost:5432/postgres" -v ON_ERROR_STOP=1 -c "SELECT version();"
+          createdb --host=localhost --username=postgres teamflow_migration_check
+          createdb --host=localhost --username=postgres teamflow_test
+
+      - name: Upgrade from empty database
+        working-directory: backend
+        run: python -m flask --app run.py db upgrade
+
+      - name: Verify migration schema and current revision
+        working-directory: backend
+        run: |
+          python -m flask --app run.py db check
+          python -m flask --app run.py db current
+          python -m pytest tests/test_postgres_migrated_schema.py
+
+      - name: Verify upgrade from the previous revision
+        working-directory: backend
+        run: |
+          python -m flask --app run.py db downgrade 207ee96fe320
+          python -m flask --app run.py db upgrade
+          python -m flask --app run.py db current
+          python -m flask --app run.py db check
+
+      - name: Run PostgreSQL integration tests
+        working-directory: backend
+        env:
+          APP_CONFIG: testing
+        run: pytest tests
+
+      - name: Remove disposable databases
+        if: always()
+        run: |
+          dropdb --host=localhost --username=postgres --if-exists teamflow_test
+          dropdb --host=localhost --username=postgres --if-exists teamflow_migration_check

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.venv/
+venv/
+backend/.venv/
+backend/.pytest_cache/
+backend/.coverage
+backend/htmlcov/
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+!.flaskenv.example
+
+backend/.env
+backend/.env.*
+!backend/.env.example
+!backend/.flaskenv.example
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Node and frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Logs and local data
+*.log
+*.sqlite3
+*.db
+
+# Git
+.gitkeep
