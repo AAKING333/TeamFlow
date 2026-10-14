@@ -4,7 +4,8 @@
 
 - Python 3.11 or newer
 - Git
-- Node.js and npm for the React frontend
+- Node.js 20 or newer and npm for the React frontend and Playwright
+- Chromium for real-browser smoke tests (`npx playwright install chromium`)
 - PostgreSQL for real integration testing and production-like local configuration
 
 ## Windows PowerShell setup
@@ -104,10 +105,13 @@ $env:TEST_DATABASE_URL = "sqlite:///:memory:"
 ..\.venv\Scripts\python.exe -m pytest tests
 ```
 
-The `backend-ci.yml` workflow runs the SQLite suite and a separate PostgreSQL
-16 job that uses separate disposable migration and test databases, migrates an
-empty database, checks the schema, tests downgrade/re-upgrade, and runs the
-full backend suite.
+The `backend-ci.yml` workflow runs the SQLite backend suite, separate frontend
+test/build checks, and a PostgreSQL 16 job that uses separate disposable
+migration and test databases, migrates an empty database, checks the schema,
+tests downgrade/re-upgrade, and runs the full backend suite. It also runs a
+disposable PostgreSQL custom-archive backup and restore drill into a third
+database. Browser smoke tests run in a separate job after the frontend checks,
+against a freshly migrated temporary SQLite database.
 
 ## Browser origin and authentication
 
@@ -129,6 +133,51 @@ $env:APP_CONFIG = "development"
 The local API base URL is `http://localhost:5000/api/v1`.
 Workspace API behavior and role rules are described in
 [workspaces.md](workspaces.md).
+
+## Browser smoke tests
+
+Install the frontend dependencies and Chromium once:
+
+```powershell
+cd D:\TeamFlow\frontend
+npm ci
+npx playwright install chromium
+```
+
+The launcher automatically uses a Python environment under `backend\.venv` or
+`backend\.VENV` when present. Otherwise, activate the Python environment
+containing `backend\requirements-dev.txt`, then run the browser suite:
+
+```powershell
+cd D:\TeamFlow
+npm --prefix frontend run e2e
+```
+
+To select a particular Python environment explicitly, set `E2E_PYTHON`:
+
+```powershell
+$env:E2E_PYTHON = "D:\TeamFlow\backend\.venv\Scripts\python.exe"
+npm --prefix frontend run e2e
+Remove-Item Env:E2E_PYTHON
+```
+
+The runner creates a uniquely named SQLite database under the operating
+system's temporary directory, applies the migrations, checks schema drift,
+downgrades and re-upgrades that isolated database, and starts Flask and Vite on
+loopback only. It removes the temporary database after Playwright stops the
+servers. It does not use or migrate
+`backend\teamflow.db`; do not change the launcher to use a developer or
+production URL. The suite covers registration/login/logout, workspace and
+project creation, invitation acceptance via the development-only in-memory
+outbox, member role restrictions, task status/priority/assignment, comments,
+notification navigation, non-member access denial, and workspace switching.
+Passwords and the one-time invitation URL are generated at runtime and are not
+written to the test report. Traces and video are disabled.
+
+On failure, Playwright writes a report and a screenshot under
+`frontend\playwright-report` and `frontend\test-results`. Review and remove
+these local diagnostics after use; they can include the synthetic test account
+names and project/task content.
 
 ## Running the frontend
 

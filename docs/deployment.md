@@ -48,12 +48,74 @@ frontend origin.
 
 ## Database backup and migration
 
-Never point tests at production or a developer database. For a production
-release, use a tested PostgreSQL backup/snapshot and maintenance/rollback
-procedure appropriate to the hosting provider. The current Alembic head is
-`d2c4b91e7a63`. First verify the release image's head and live database
-revision; then apply the forward migration as a separately controlled release
-step:
+Never point tests or the backup/restore drill at production or a developer
+database. Keep provider-managed point-in-time recovery enabled where available;
+also take logical backups on a schedule appropriate to the recovery-point
+objective. A `pg_dump` custom archive is not encrypted by itself. Use TLS for
+the database connection, encrypt the archive with the organization's approved
+KMS/backup service before upload, restrict read/write access to the backup
+identity and recovery operators, and enforce documented retention and deletion
+periods. Never store archives, database credentials, or unredacted connection
+URLs in the repository, build logs, or public artifacts.
+
+Configure libpq access through a protected service definition and a
+secret-managed password file (for example, a `PGSERVICEFILE` and
+`PGPASSFILE` readable only by the backup account); do not put passwords in
+command-line arguments. Set a restrictive umask and write the archive to a
+private directory. Example Bash commands, with the service and paths supplied
+by the deployment secret manager:
+
+```bash
+umask 077
+export PGSERVICE=teamflow-production-backup
+backup_file="/secure-temporary/teamflow-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump --format=custom --no-owner --no-privileges --file="$backup_file"
+pg_restore --list "$backup_file" >/dev/null
+sha256sum "$backup_file"
+```
+
+Encrypt the verified archive before transferring it to access-controlled
+backup storage; the example deliberately does not specify a storage vendor or
+credentials. Record the checksum, backup time, application release and schema
+revision in the restricted recovery inventory. A successful `pg_restore
+--list` validates archive readability, not that a recovery works; periodically
+restore into a separate, empty, disposable PostgreSQL database and validate
+the schema and representative application relationships. Do not use a
+production database as the restore target.
+
+For a recovery drill, provision a new empty database with a restricted restore
+role, configure a separate libpq service name/secret for it, and restore
+without cleaning or dropping objects in an existing database:
+
+```bash
+export PGSERVICE=teamflow-disposable-restore
+pg_restore --exit-on-error --no-owner --no-privileges \
+  --dbname="service=teamflow-disposable-restore" "$backup_file"
+```
+
+After restore, compare `alembic_version` with the release's migration head;
+run `flask db check` against the restored database using a non-production
+verification environment; and check representative user, membership,
+workspace, project, task, comment/activity, and notification relationships.
+Validate application readiness and a read-only workflow in an isolated
+environment. A database archive does not include PostgreSQL cluster roles or
+their passwords; recover those separately from the secret manager/provider
+procedure. The deployment provider is not specified here, so its snapshot,
+encryption, retention, and point-in-time recovery setup remain operator tasks.
+
+CI includes a disposable PostgreSQL backup/restore drill. It seeds only
+synthetic records in the dedicated `teamflow_migration_check` database,
+creates a mode-restricted custom archive in the runner's temporary directory,
+restores into a separate empty `teamflow_backup_restore_check` database, and
+checks the current Alembic head plus linked membership, project, task,
+comment, activity, and notification records and UTC timestamps. It removes
+the archive and drops only those disposable CI databases. A green CI drill is
+evidence for this synthetic PostgreSQL restore path, not proof of a live
+provider's backup policies or a production disaster-recovery process.
+
+The current Alembic head is `d2c4b91e7a63`. First verify the release image's
+head and live database revision; then apply the forward migration as a
+separately controlled release step:
 
 ```powershell
 cd D:\TeamFlow\backend
@@ -70,7 +132,12 @@ Do not run a downgrade as a routine rollback. Downgrades that drop tables
 notifications) permanently discard the data in those tables. For an application
 rollback, prefer deploying a compatible previous application release while
 keeping the additive schema, or restore a verified database backup only under
-the incident plan. Review each migration's downgrade before considering it.
+the incident plan and only to a separate recovery target before any controlled
+cutover. If a migration or release fails, stop the rollout, retain the failed
+release and logs, inspect the database revision and migration's transactional
+behavior, and rehearse a forward fix or restore using a separate database.
+Never blindly downgrade, drop objects, or restore over the production database.
+Review each migration's downgrade before considering it.
 
 ### Safe local SQLite upgrade
 
@@ -119,9 +186,13 @@ to head, checks the actual migrated constraints/indexes/types, downgrades and
 re-upgrades the disposable migration database, runs schema-drift checks, and
 runs the complete backend suite on PostgreSQL. The SQLite suite remains
 in-memory and separate. CI tears down its PostgreSQL service and explicitly
-drops both disposable databases, including after failed steps.
+drops the migration, test, and restore databases, including after failed steps.
 
-There is no browser-based E2E runner configured. Frontend tests use Vitest and
-Testing Library; backend API integration tests exercise their matching server
-flows. Add a browser E2E runner in a later phase if release requirements call
-for real-browser verification.
+Frontend tests/build and Playwright/Chromium browser E2E run in separate CI
+jobs, with browser E2E depending on the frontend checks. E2E uses a fresh
+temporary SQLite database; its invitation journey uses only the development
+in-memory invitation outbox. Playwright traces and video are disabled to avoid
+retaining one-time invitation URLs. This verifies browser journeys against the
+local Flask/Vite processes, not browser behavior against a deployed origin.
+PostgreSQL backend and restore checks run in a separate PostgreSQL CI job. No
+email provider or external notification delivery is configured.

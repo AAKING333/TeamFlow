@@ -57,6 +57,7 @@ jobs:
       DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_migration_check
       TEST_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_test
       MIGRATION_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_migration_check
+      RESTORE_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/teamflow_backup_restore_check
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -86,6 +87,7 @@ jobs:
           psql "postgresql://postgres@localhost:5432/postgres" -v ON_ERROR_STOP=1 -c "SELECT version();"
           createdb --host=localhost --username=postgres teamflow_migration_check
           createdb --host=localhost --username=postgres teamflow_test
+          createdb --host=localhost --username=postgres teamflow_backup_restore_check
 
       - name: Upgrade from empty database
         working-directory: backend
@@ -106,6 +108,31 @@ jobs:
           python -m flask --app run.py db current
           python -m flask --app run.py db check
 
+      - name: Run disposable PostgreSQL backup and restore drill
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          backup_file="$(mktemp "$RUNNER_TEMP/teamflow-backup-restore-XXXXXX.dump")"
+          chmod 600 "$backup_file"
+          trap 'rm -f -- "$backup_file"' EXIT
+          python scripts/backup_restore_drill.py seed
+          pg_dump \
+            --format=custom \
+            --no-owner \
+            --no-privileges \
+            --file="$backup_file" \
+            "postgresql://postgres@localhost:5432/teamflow_migration_check"
+          pg_restore --list "$backup_file" > /dev/null
+          pg_restore \
+            --exit-on-error \
+            --no-owner \
+            --no-privileges \
+            --dbname="postgresql://postgres@localhost:5432/teamflow_backup_restore_check" \
+            "$backup_file"
+          DATABASE_URL="$RESTORE_DATABASE_URL" python scripts/backup_restore_drill.py verify
+          DATABASE_URL="$RESTORE_DATABASE_URL" python -m flask --app run.py db current
+          DATABASE_URL="$RESTORE_DATABASE_URL" python -m flask --app run.py db check
+
       - name: Run PostgreSQL integration tests
         working-directory: backend
         env:
@@ -115,5 +142,92 @@ jobs:
       - name: Remove disposable databases
         if: always()
         run: |
-          dropdb --host=localhost --username=postgres --if-exists teamflow_test
-          dropdb --host=localhost --username=postgres --if-exists teamflow_migration_check
+          status=0
+          for database in \
+            teamflow_test \
+            teamflow_backup_restore_check \
+            teamflow_migration_check; do
+            if ! dropdb --host=localhost --username=postgres --if-exists "$database"; then
+              echo "Failed to remove disposable database: $database" >&2
+              status=1
+            fi
+          done
+          exit "$status"
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Type-check and build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Type-check browser tests
+        working-directory: frontend
+        run: npm run typecheck:e2e
+
+  browser-e2e:
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-dev.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser smoke tests
+        working-directory: frontend
+        run: npm run e2e
+
+      - name: Preserve safe browser failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teamflow-browser-e2e-failure
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 3

@@ -38,6 +38,8 @@ Thumbs.db
 frontend/node_modules/
 frontend/dist/
 frontend/build/
+frontend/playwright-report/
+frontend/test-results/
 
 # Logs and local data
 *.log
