@@ -25,10 +25,10 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
-function renderApp() {
+function renderApp(initialEntry = "/login") {
   return render(
     <AuthProvider>
-      <MemoryRouter initialEntries={["/login"]}>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <App />
       </MemoryRouter>
     </AuthProvider>,
@@ -192,6 +192,47 @@ describe("authentication flow", () => {
 
     expect(
       await screen.findByText("This email is already registered."),
+    ).toBeVisible();
+  });
+
+  it("treats an unauthenticated account response as signed out", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(
+          { error: "authentication_failed", message: "Sign in required." },
+          401,
+        ),
+      ),
+    );
+    renderApp("/");
+
+    expect(
+      await screen.findByRole("heading", { name: "Sign in to TeamFlow" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(
+        "TeamFlow could not reach the server. Check that the backend is running and try again.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the account load error when the account request is rejected", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Failed to fetch");
+      }),
+    );
+    renderApp("/");
+
+    expect(
+      await screen.findByText(
+        "TeamFlow could not reach the server. Check that the backend is running and try again.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText("Refresh the page to retry loading your account."),
     ).toBeVisible();
   });
 

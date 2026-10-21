@@ -15,9 +15,11 @@ npm install
 Copy-Item .env.example .env.local
 ```
 
-`VITE_API_BASE_URL` defaults to `http://localhost:5000/api/v1`. Set it in
-`.env.local` only when the backend is running at another address. Vite exposes
-`VITE_` variables to browser code, so never put secrets in this file.
+In local Vite development, leave `VITE_API_BASE_URL` unset: requests use the
+same-origin `/api/v1` path and Vite proxies them to the backend at
+`http://127.0.0.1:5000`. Set an absolute `VITE_API_BASE_URL` in `.env.local`
+only when intentionally using a separate API host. Vite exposes `VITE_`
+variables to browser code, so never put secrets in this file.
 
 Start the backend in a separate terminal. From the repository root, activate
 the repository virtual environment before changing to `backend`:
@@ -37,9 +39,11 @@ cd D:\TeamFlow\frontend
 npm run dev
 ```
 
-Open the local Vite URL, normally `http://localhost:5173`. The backend's
-`FRONTEND_ORIGIN` must exactly match that origin. The default is already
-`http://localhost:5173`.
+Open the local Vite URL, normally `http://localhost:5173` (or
+`http://127.0.0.1:5173`). The development proxy keeps normal API requests
+same-origin, so the backend's exact `FRONTEND_ORIGIN` CORS rule is only used
+for direct cross-origin requests; it also remains the origin used in generated
+invitation URLs. The backend continues to listen on port 5000.
 
 ## Authentication flow
 
