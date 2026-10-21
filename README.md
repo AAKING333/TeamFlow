@@ -26,7 +26,9 @@ and workspace-scoped projects are implemented:
 The React + TypeScript frontend provides registration, login, a protected
 account shell, logout, and workspace/project loading, creation, and selection
 through typed API clients. Authentication uses signed-cookie sessions and does
-not issue bearer tokens. See [workspace API and authorization](docs/workspaces.md).
+not issue bearer tokens. Workspace owners/admins can create invitations, which
+use the configured invitation email provider in production and the explicit
+one-time development outbox locally. See [workspace API and authorization](docs/workspaces.md).
 
 ## Planned product capabilities
 
@@ -103,7 +105,33 @@ Copy-Item backend\.env.example backend\.env
 Copy-Item backend\.flaskenv.example backend\.flaskenv
 ```
 
-Example values are placeholders only. Do not commit real secrets.
+Example values are placeholders only. Do not commit real secrets;
+`backend\.env` is git-ignored.
+
+### Sending real invitation emails (Gmail)
+
+By default no email is sent: workspace invitations use a local development
+outbox. To send real invitations from a Gmail account, turn on 2-Step
+Verification, create an App Password (Google Account > Security > App
+passwords), and set the following in `backend\.env` (placeholders shown), using
+the same Gmail address for `INVITATION_EMAIL_FROM` and `SMTP_USERNAME`:
+
+```text
+INVITATION_EMAIL_PROVIDER=smtp
+INVITATION_EMAIL_FROM=TeamFlow <your-address@gmail.com>
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_USERNAME=your-address@gmail.com
+SMTP_PASSWORD=replace-with-a-gmail-app-password
+```
+
+Then restart the backend and invite an address you control to test it. Gmail
+limits daily sends and messages may land in spam; "accepted" means the email
+server took the message, not that it reached an inbox. Real delivery is
+unverified until you test it with your own credentials (automated tests use a
+fake SMTP server). See
+[the Gmail setup and troubleshooting guide](docs/development-setup.md#sending-real-invitation-email-with-gmail-smtp).
 
 ## Database setup
 
@@ -224,9 +252,9 @@ for the full flow, CSRF contract, and deployment rate-limiting strategy.
 
 - Workspaces and projects are not implemented yet.
 - PostgreSQL integration is configured in CI using a disposable PostgreSQL 16 service; no local PostgreSQL service is available in every development environment.
-- The latest migration head is `d2c4b91e7a63`; the existing local SQLite database remains at `e71a9c3d5f20` and has not been migrated to it. PostgreSQL remains unverified.
+- The latest migration head is `f0a1b2c3d4e5`. Existing local databases are never migrated automatically: after pulling changes that add migrations, back up your development database and run `flask --app run.py db upgrade` from `backend` (tests use fresh in-memory databases and do not exercise your real one). PostgreSQL remains unverified.
 - The database readiness check is implemented and tested with a safe simulated failure path.
-- Task assignment and comment notifications are documented in [the notification guide](docs/notifications.md); no email or external notification delivery is configured.
+- Task assignment and comment notifications are documented in [the notification guide](docs/notifications.md); they remain in-app only. Workspace invitations have a separate, configured email delivery path documented in [the workspace guide](docs/workspaces.md).
 
 ## Security notes
 

@@ -34,6 +34,65 @@ Important values:
 - `TEST_DATABASE_URL`: safe test database URL, usually SQLite in-memory
 - `LOG_LEVEL`: logging level for the app
 - `FRONTEND_ORIGIN`: exact browser origin allowed to make credentialed API requests
+- `INVITATION_EMAIL_PROVIDER`: `development` for the explicit local outbox (no
+  email is sent), `smtp` for Gmail or any SMTP server, or `resend` (needs a
+  verified sending domain)
+- `INVITATION_EMAIL_FROM`: sender address; for Gmail it must be the same Gmail
+  address as `SMTP_USERNAME` (or a verified "Send mail as" alias)
+- `SMTP_HOST` (default `smtp.gmail.com`), `SMTP_PORT` (default `587`),
+  `SMTP_SECURITY` (`starttls` or `ssl`; defaults to `starttls` for 587 and
+  `ssl` for 465), `SMTP_USERNAME`, `SMTP_PASSWORD`: used only by the `smtp`
+  provider
+- `RESEND_API_KEY`: server-side provider key for the `resend` provider
+- `INVITATION_EMAIL_TIMEOUT_SECONDS`: provider timeout from 1 through 30
+
+`python run.py` and `flask run` read `backend\.env` automatically
+(`python-dotenv` is already in `requirements.txt`). Variables already set in
+your shell win over the file, so remove a stale shell value with
+`Remove-Item Env:SMTP_PASSWORD`. Settings are read once at startup: restart the
+backend after editing `.env`. Save the file as UTF-8. `backend\.env` is
+git-ignored and must never be committed. Test runs (`APP_CONFIG=testing`) and
+the browser E2E runner never read it and never use SMTP.
+
+### Real invitation email with Gmail (SMTP)
+
+With the default `INVITATION_EMAIL_PROVIDER=development`, **no email is sent**;
+invitations only create a local link. To send real invitation emails through
+your own Gmail account:
+
+1. Turn on 2-Step Verification for the Google account.
+2. Create an App Password: Google Account > Security > App passwords. Google
+   shows 16 characters in groups of four; spaces are ignored by TeamFlow.
+3. Put the values only in `backend\.env` (never in a tracked file, chat, or
+   issue). Replace every placeholder:
+
+   ```text
+   INVITATION_EMAIL_PROVIDER=smtp
+   INVITATION_EMAIL_FROM=TeamFlow <your-address@gmail.com>
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_SECURITY=starttls
+   SMTP_USERNAME=your-address@gmail.com
+   SMTP_PASSWORD=replace-with-a-gmail-app-password
+   ```
+
+   `INVITATION_EMAIL_FROM` must use the same Gmail address as `SMTP_USERNAME`;
+   Gmail rewrites or rejects other senders.
+4. Stop the backend (Ctrl+C) and start it again with `python run.py`. Startup
+   fails with a message naming the bad setting (never its value) when anything
+   is missing, a placeholder, or unsafe.
+5. Test deliberately: in the Members panel invite an address you control. A
+   success message means the email server accepted the message, not that it
+   reached an inbox; check the inbox and the spam folder. Real delivery is
+   unverified until you have done this with your own credentials: the automated
+   tests use a fake SMTP server and never send email.
+
+TeamFlow always verifies TLS certificates and never sends credentials over an
+unencrypted connection. Gmail limits how many messages an account can send per
+day, and messages from a personal address may land in spam. See
+[the development guide](../docs/development-setup.md#sending-real-invitation-email-with-gmail-smtp)
+for troubleshooting (535 authentication errors, missing App passwords option,
+Google Workspace restrictions, and timeouts).
 
 The default `DATABASE_URL` in `.env.example` uses the existing local SQLite
 database. PostgreSQL is selected explicitly with a URL such as
@@ -137,12 +196,16 @@ and retention rules are documented in
 ## Database and migrations
 
 The Alembic repository includes migrations for users, sessions, workspaces,
-memberships, projects, tasks, comments, activity, invitations, and
-notifications. The current migration head is `d2c4b91e7a63`. The existing
-local SQLite database remains at `e71a9c3d5f20` and is not migrated
-automatically when the code is updated. Inspect the selected database before
-running `db upgrade`; notification migration verification uses an isolated
-SQLite database.
+memberships, projects, tasks, comments, activity, invitations, invitation
+email delivery outcomes, and notifications. The current migration head is
+`f0a1b2c3d4e5`. An existing local database is never migrated automatically when
+the code is updated. **After pulling changes that add migrations, run
+`flask db upgrade` on your existing development database (make a backup
+first).** Automated tests use fresh in-memory databases and do not exercise
+your real development database, so tests can pass while the Members panel
+fails with HTTP 500 (for example `no such column`) on a database that is behind.
+Inspect the selected database before running `db upgrade`; migration
+verification uses an isolated SQLite database.
 
 Inspect the actual selected database revision before applying a migration.
 For an existing local database, make a backup, verify that the selected URL is

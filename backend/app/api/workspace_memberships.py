@@ -4,14 +4,23 @@ import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlencode
 
 from flask import Blueprint, current_app, g, jsonify, request
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
 from ..models import Notification, User, WorkspaceInvitation, WorkspaceMembership
-from ..services.invitation_delivery import DevelopmentInvitationOutbox, InvitationDelivery
+from ..services.invitation_delivery import (
+    DeliveryMisconfigured,
+    DeliveryRejected,
+    DeliveryResult,
+    DeliveryUnknown,
+    DevelopmentInvitationOutbox,
+    InvitationDelivery,
+)
+from ..services.invitation_email import build_invitation_email
 from .auth import EMAIL_PATTERN, require_authenticated_user, verify_csrf_token
 from .workspaces import (
     current_membership,
@@ -46,6 +55,7 @@ def invitation_response(invitation: WorkspaceInvitation) -> dict[str, Any]:
             else None
         ),
         "status": invitation.status,
+        "delivery_status": invitation.delivery_status,
         "created_at": format_utc(invitation.created_at),
         "expires_at": format_utc(invitation.expires_at),
     }
@@ -76,6 +86,169 @@ def _invitation_unavailable(status: int = 410):
         "This invitation is expired, revoked, or has already been used.",
         status,
     )
+
+
+def _delivery_error(
+    code: str,
+    message: str,
+    status: int,
+    delivery_status: str,
+    invitation: WorkspaceInvitation | None = None,
+    reason: str | None = None,
+):
+    body: dict[str, Any] = {
+        "error": code,
+        "message": message,
+        "delivery_status": delivery_status,
+    }
+    if reason is not None:
+        body["reason"] = reason
+    if invitation is not None:
+        body["invitation"] = invitation_response(invitation)
+    return jsonify(body), status
+
+
+def _deliver_and_record(
+    invitation: WorkspaceInvitation,
+    raw_token: str,
+    delivery: InvitationDelivery,
+) -> tuple[str, WorkspaceInvitation | None, bool]:
+    misconfigured = False
+    try:
+        invitation_url = (
+            f"{current_app.config['FRONTEND_ORIGIN'].rstrip('/')}/accept-invitation?"
+            f"{urlencode({'token': raw_token})}"
+        )
+        message = build_invitation_email(
+            invitation_id=invitation.id,
+            recipient_email=invitation.email,
+            workspace_name=invitation.workspace.name,
+            inviter_name=invitation.inviter.name if invitation.inviter else None,
+            role=invitation.role,
+            expires_at=invitation.expires_at,
+            invitation_url=invitation_url,
+        )
+        result = delivery.deliver(message)
+        delivery_status = result.status if isinstance(result, DeliveryResult) else "unknown"
+        if delivery_status not in {"accepted", "development_outbox"}:
+            delivery_status = "unknown"
+    except DeliveryRejected as error:
+        delivery_status = "rejected"
+        misconfigured = isinstance(error, DeliveryMisconfigured)
+    except DeliveryUnknown:
+        delivery_status = "unknown"
+    except Exception:
+        delivery_status = "unknown"
+
+    try:
+        outcome = db.session.execute(
+            update(WorkspaceInvitation)
+            .where(
+                WorkspaceInvitation.id == invitation.id,
+                WorkspaceInvitation.token_hash == _token_digest(raw_token),
+                WorkspaceInvitation.status == "pending",
+            )
+            .values(delivery_status=delivery_status)
+        )
+        if outcome.rowcount != 1:
+            db.session.rollback()
+            return "superseded", None, False
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        return "outcome_failed", None, False
+
+    current = db.session.scalar(
+        select(WorkspaceInvitation).where(WorkspaceInvitation.id == invitation.id)
+    )
+    return delivery_status, current, misconfigured
+
+
+def _delivery_response(
+    invitation: WorkspaceInvitation,
+    delivery_status: str,
+    operation: str,
+    http_status: int,
+    misconfigured: bool = False,
+):
+    if delivery_status == "accepted":
+        return (
+            jsonify(
+                {
+                    "invitation": invitation_response(invitation),
+                    "delivery_status": delivery_status,
+                    "message": (
+                        f"Invitation {operation}. The email provider accepted the message "
+                        "for processing; inbox delivery is not guaranteed."
+                    ),
+                }
+            ),
+            http_status,
+        )
+    if delivery_status == "development_outbox":
+        return (
+            jsonify(
+                {
+                    "invitation": invitation_response(invitation),
+                    "delivery_status": delivery_status,
+                    "message": (
+                        f"Invitation {operation}. No email was sent; use the local "
+                        "development outbox to retrieve the link."
+                    ),
+                }
+            ),
+            http_status,
+        )
+    if delivery_status == "rejected" and misconfigured:
+        return _delivery_error(
+            "invitation_delivery_rejected",
+            "Invitation email delivery is misconfigured on the server; no successful "
+            "delivery was recorded. Ask the server administrator to check the email settings.",
+            502,
+            delivery_status,
+            invitation,
+            reason="misconfigured",
+        )
+    if delivery_status == "rejected":
+        return _delivery_error(
+            "invitation_delivery_rejected",
+            "The email provider rejected this invitation; no successful delivery was recorded.",
+            502,
+            delivery_status,
+            invitation,
+        )
+    return _delivery_error(
+        "invitation_delivery_unavailable",
+        "Invitation email delivery was not confirmed. Retry the invitation or revoke it.",
+        503,
+        "unknown",
+        invitation,
+    )
+
+
+def _complete_delivery(
+    invitation: WorkspaceInvitation,
+    raw_token: str,
+    delivery: InvitationDelivery,
+    operation: str,
+    http_status: int,
+):
+    delivery_status, current, misconfigured = _deliver_and_record(invitation, raw_token, delivery)
+    if delivery_status == "superseded":
+        return _delivery_error(
+            "invitation_delivery_superseded",
+            "This invitation changed before delivery completed. Refresh and try again.",
+            409,
+            "unknown",
+        )
+    if delivery_status == "outcome_failed" or current is None:
+        return _delivery_error(
+            "invitation_delivery_unavailable",
+            "Invitation delivery could not be confirmed. Refresh and retry the invitation.",
+            503,
+            "unknown",
+        )
+    return _delivery_response(current, delivery_status, operation, http_status, misconfigured)
 
 
 @workspace_memberships_bp.post("/<int:workspace_id>/invitations")
@@ -159,6 +332,7 @@ def create_invitation(workspace_id: int):
         expires_at=now + INVITATION_LIFETIME,
         inviter_id=g.current_user.id,
         status="pending",
+        delivery_status="pending",
     )
     db.session.add(invitation)
     try:
@@ -182,31 +356,59 @@ def create_invitation(workspace_id: int):
     except SQLAlchemyError as error:
         rollback_and_raise(error)
 
-    invitation_url = (
-        f"{current_app.config['FRONTEND_ORIGIN'].rstrip('/')}/accept-invitation?token={token}"
-    )
-    delivery_status = delivery.deliver(
-        invitation.id,
-        invitation.email,
-        invitation_url,
-        invitation.expires_at,
-    )
+    return _complete_delivery(invitation, token, delivery, "created", 201)
 
-    return (
-        jsonify(
-            {
-                "invitation": invitation_response(invitation),
-                "delivery_status": delivery_status,
-                "message": (
-                    "Invitation created. No email was sent; use the local development "
-                    "outbox to retrieve the link."
-                    if delivery_status == "development_outbox"
-                    else "Invitation created and delivery completed."
-                ),
-            }
-        ),
-        201,
+
+@workspace_memberships_bp.post("/<int:workspace_id>/invitations/<int:invitation_id>/resend")
+@require_authenticated_user
+def resend_invitation(workspace_id: int, invitation_id: int):
+    membership, error = _unauthorized_workspace_role(workspace_id)
+    if error is not None:
+        return error
+    delivery: InvitationDelivery | None = current_app.extensions.get("invitation_delivery")
+    if delivery is None:
+        return workspace_error(
+            "invitation_delivery_unconfigured",
+            "Invitation delivery is not configured; no resend was attempted.",
+            503,
+        )
+    if request.get_data(cache=True):
+        return validation_error({"body": "The resend request body must be empty."})
+
+    invitation = db.session.scalar(
+        select(WorkspaceInvitation)
+        .where(
+            WorkspaceInvitation.id == invitation_id,
+            WorkspaceInvitation.workspace_id == workspace_id,
+        )
+        .with_for_update()
     )
+    if invitation is None:
+        return workspace_error("invitation_not_found", "The invitation was not found.", 404)
+    if membership.role == "admin" and invitation.role != "member":
+        return workspace_error(
+            "permission_denied", "Only the workspace owner may resend an admin invitation.", 403
+        )
+    now = datetime.now(UTC)
+    if invitation.status != "pending" or _utc(invitation.expires_at) <= now:
+        if invitation.status == "pending":
+            invitation.status = "expired"
+            try:
+                db.session.commit()
+            except SQLAlchemyError as error:
+                rollback_and_raise(error)
+        return _invitation_unavailable()
+
+    token = secrets.token_urlsafe(32)
+    invitation.token_hash = _token_digest(token)
+    invitation.expires_at = now + INVITATION_LIFETIME
+    invitation.delivery_status = "pending"
+    try:
+        db.session.commit()
+    except SQLAlchemyError as error:
+        rollback_and_raise(error)
+
+    return _complete_delivery(invitation, token, delivery, "resent", 200)
 
 
 @workspace_memberships_bp.get("/<int:workspace_id>/invitations")

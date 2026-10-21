@@ -6,12 +6,19 @@ export default defineConfig({
   forbidOnly: Boolean(process.env.CI),
   retries: 0,
   workers: 1,
-  reporter: [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]],
-  outputDir: "test-results",
+  reporter: [["list"], ["html", {
+    outputFolder: process.env.TEAMFLOW_E2E_ARTIFACT_DIR
+      ? `${process.env.TEAMFLOW_E2E_ARTIFACT_DIR}/playwright-report`
+      : "playwright-report",
+    open: "never",
+  }]],
+  outputDir: process.env.TEAMFLOW_E2E_ARTIFACT_DIR
+    ? `${process.env.TEAMFLOW_E2E_ARTIFACT_DIR}/test-results`
+    : "test-results",
   use: {
     baseURL: "http://127.0.0.1:5173",
     trace: "off",
-    screenshot: "only-on-failure",
+    screenshot: "off",
     video: "off",
   },
   projects: [

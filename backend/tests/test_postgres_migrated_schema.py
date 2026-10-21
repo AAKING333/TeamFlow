@@ -8,7 +8,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.inspection import inspect
 
-EXPECTED_REVISION = "d2c4b91e7a63"
+EXPECTED_REVISION = "f0a1b2c3d4e5"
 EXPECTED_DATABASE = "teamflow_migration_check"
 
 
@@ -58,6 +58,15 @@ def test_migrated_postgres_schema_matches_release_expectations():
             index["name"] for index in inspector.get_indexes("workspace_invitations")
         }
         assert "uq_workspace_invitations_pending_email" in invitation_indexes
+        invitation_columns = {
+            column["name"]: column for column in inspector.get_columns("workspace_invitations")
+        }
+        assert invitation_columns["delivery_status"]["nullable"] is False
+        assert invitation_columns["delivery_status"]["default"] == "'unknown'::character varying"
+        invitation_checks = {
+            check["name"] for check in inspector.get_check_constraints("workspace_invitations")
+        }
+        assert "ck_workspace_invitations_delivery_status" in invitation_checks
 
         activity_task_fk = next(
             foreign_key

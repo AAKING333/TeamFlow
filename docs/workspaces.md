@@ -61,7 +61,10 @@ unauthorized role operations return `permission_denied`.
   and case-folded to match account normalization. Owners may invite admins or
   members; admins may invite members only.
 - `GET /api/v1/workspaces/<workspace_id>/invitations` lists unexpired pending
-  invitations for owners/admins.
+  invitations for owners/admins, including the non-sensitive `delivery_status`.
+- `POST /api/v1/workspaces/<workspace_id>/invitations/<invitation_id>/resend`
+  rotates the token and retries delivery for an eligible pending invitation.
+  It accepts no request body and uses the same owner/admin authorization.
 - `DELETE /api/v1/workspaces/<workspace_id>/invitations/<invitation_id>`
   revokes a pending invitation. Admins may revoke member invitations only.
 - `POST /api/v1/invitations/accept` accepts `{"token": "..."}` for the
@@ -75,18 +78,35 @@ accepted, and revoked invitations cannot be reused. Acceptance and membership
 creation are committed together; the membership unique constraint protects
 against duplicate membership.
 
-No email delivery provider is configured. Creating an invitation does **not**
-send email. Without a configured delivery adapter, invitation creation is
-rejected in non-development environments and no database record is created.
-In development, the raw token is held only in a volatile,
-one-time local outbox and can be retrieved by a workspace owner/admin through
-`GET /api/v1/workspaces/<workspace_id>/invitations/<invitation_id>/development-link`.
+The separate `delivery_status` describes only what TeamFlow knows about the
+email request: `pending` means the attempt has no recorded outcome, `accepted`
+means the configured provider (or SMTP server) accepted the request for
+processing (not inbox placement), `rejected` means the provider definitively
+rejected it (a rejection caused by server-side email misconfiguration, such as
+bad SMTP credentials, also carries `"reason": "misconfigured"` and a generic
+message without secret details), `unknown`
+means acceptance was not confirmed, and `development_outbox` means no email was
+sent and a local one-time link is held in memory. A provider rejection or
+uncertain result is returned as a non-success response, remains retryable while
+the invitation is pending, and never silently becomes a development link.
+Resend rotates the token before delivery, so earlier links stop working; a
+process crash between the two commits leaves a truthful `pending` outcome.
+
+In development and automated testing, `INVITATION_EMAIL_PROVIDER=development`
+uses the explicit volatile outbox. Authorized users can retrieve its link once
+through `GET /api/v1/workspaces/<workspace_id>/invitations/<invitation_id>/development-link`.
 That endpoint exists only in development mode, is authenticated and
 workspace-scoped, returns `Cache-Control: no-store`, and cannot retrieve a
-token a second time. Ordinary create/list responses never contain a token or
-its hash. The outbox is lost when the backend restarts. Production delivery
-needs a configured provider before invitations can be distributed; tokens
-must not be placed in production logs.
+token a second time. `INVITATION_EMAIL_PROVIDER=smtp` (for example Gmail with
+an App Password, see [the development guide](development-setup.md#sending-real-invitation-email-with-gmail-smtp))
+sends real email in development or production. In production, startup requires
+`INVITATION_EMAIL_PROVIDER=resend` (a structurally valid server-side
+`RESEND_API_KEY`) or `smtp` (valid `SMTP_*` settings), a valid
+`INVITATION_EMAIL_FROM`, and a valid frontend origin; incomplete configuration
+fails startup and provider failures never fall back to a local link. The endpoint uses the existing `/accept-invitation?token=`
+frontend route and the unchanged CSRF-protected acceptance API. Ordinary
+responses, logs, and database rows never contain a raw token, token hash, or
+full bearer URL.
 
 The authenticated workspace selector includes a member-management panel with
 role controls, pending invitations, and leave/remove actions. The invitation

@@ -2,6 +2,7 @@ interface ApiErrorBody {
   error?: string;
   message?: string;
   fields?: Record<string, string>;
+  reason?: string;
 }
 
 export class ApiError extends Error {
@@ -10,15 +11,21 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly fields?: Record<string, string>,
+    readonly reason?: string,
   ) {
     super(message);
     this.name = "ApiError";
   }
 }
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000/api/v1"
-).replace(/\/+$/, "");
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+const defaultApiBaseUrl = import.meta.env.DEV
+  ? "/api/v1"
+  : "http://localhost:5000/api/v1";
+const API_BASE_URL = (configuredApiBaseUrl || defaultApiBaseUrl).replace(
+  /\/+$/,
+  "",
+);
 
 export async function apiRequest<T>(
   path: string,
@@ -51,6 +58,7 @@ export async function apiRequest<T>(
       response.status,
       body?.error,
       body?.fields,
+      typeof body?.reason === "string" ? body.reason : undefined,
     );
   }
 

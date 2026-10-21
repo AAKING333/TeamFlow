@@ -29,6 +29,12 @@ class WorkspaceInvitation(db.Model):
             "status IN ('pending', 'accepted', 'revoked', 'expired')",
             name="ck_workspace_invitations_status",
         ),
+        CheckConstraint(
+            "delivery_status IN ("
+            "'pending', 'accepted', 'rejected', 'unknown', 'development_outbox'"
+            ")",
+            name="ck_workspace_invitations_delivery_status",
+        ),
         UniqueConstraint("token_hash", name="uq_workspace_invitations_token_hash"),
         Index(
             "uq_workspace_invitations_pending_email",
@@ -57,6 +63,9 @@ class WorkspaceInvitation(db.Model):
         DateTime(timezone=True), nullable=False, default=utc_now
     )
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    delivery_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'unknown'")
+    )
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -82,4 +91,16 @@ class WorkspaceInvitation(db.Model):
             "expired",
         }:
             raise ValueError("Unsupported invitation status.")
+        return value
+
+    @validates("delivery_status")
+    def _validate_delivery_status(self, _key: str, value: str) -> str:
+        if not isinstance(value, str) or value not in {
+            "pending",
+            "accepted",
+            "rejected",
+            "unknown",
+            "development_outbox",
+        }:
+            raise ValueError("Unsupported invitation delivery status.")
         return value

@@ -9,9 +9,9 @@ deduplication keys also prevent duplicate event inserts.
 
 Notifications contain only a concise, generic message and workspace, project,
 and task IDs. They do not contain comment text, email addresses, invitation
-tokens, or arbitrary client-provided payloads. Workspace invitations do not
-produce notifications because TeamFlow does not yet provide a token-safe
-notification acceptance flow or email delivery.
+tokens, or arbitrary client-provided payloads. Workspace invitations use a
+separate configured email-delivery path and do not create in-app notifications;
+invitation emails contain no task, comment, or other private workspace content.
 
 All routes require an authenticated signed-cookie session. State-changing
 routes require the existing `X-CSRF-Token` header.

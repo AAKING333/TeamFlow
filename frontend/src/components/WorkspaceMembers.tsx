@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import { ApiError } from "../api/client";
@@ -9,6 +9,7 @@ import {
   type WorkspaceMember,
 } from "../api/workspaces";
 import { useAuth } from "../auth/AuthContext";
+import { ConfirmDialog } from "./Ui";
 
 interface WorkspaceMembersProps {
   workspace: Workspace;
@@ -17,6 +18,62 @@ interface WorkspaceMembersProps {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Workspace members could not be loaded.";
+}
+
+function loadErrorMessage(error: unknown, subject: string) {
+  if (error instanceof ApiError) {
+    switch (error.code) {
+      case "permission_denied":
+        return `You do not have permission to view ${subject.toLowerCase()}.`;
+      case "workspace_not_found":
+        return "This workspace could not be found. It may have been deleted, or you may have lost access.";
+      case "internal_server_error":
+        return `${subject} could not be loaded because the server reported an error. If TeamFlow was just updated, run the database migrations (flask db upgrade), restart the backend, and try again.`;
+      default:
+        return error.message;
+    }
+  }
+  return error instanceof Error ? error.message : `${subject} could not be loaded.`;
+}
+
+function deliveryNoticeFor(status: WorkspaceInvitation["delivery_status"]) {
+  if (status === "accepted") {
+    return "The email was handed to the email server. Inbox delivery is not guaranteed, so if it does not arrive, ask the recipient to check their spam folder.";
+  }
+  if (status === "development_outbox") {
+    return "No email was sent: this server has no email provider configured (local development outbox). Use Get local test link below, or set up SMTP to send real email.";
+  }
+  return null;
+}
+
+function invitationDeliveryLabel(status: WorkspaceInvitation["delivery_status"]) {
+  switch (status) {
+    case "accepted":
+      return "Email provider accepted · inbox delivery not guaranteed";
+    case "rejected":
+      return "Email provider rejected";
+    case "unknown":
+      return "Email delivery not confirmed";
+    case "development_outbox":
+      return "Local link only · no email sent";
+    default:
+      return "Delivery pending";
+  }
+}
+
+function deliveryErrorMessage(error: ApiError) {
+  switch (error.code) {
+    case "invitation_delivery_rejected":
+      return error.reason === "misconfigured"
+        ? "Email delivery is misconfigured on the server, so no email was sent. Ask the server administrator to check the email settings, then retry the invitation."
+        : "The email provider rejected this invitation. No email was sent; retry or revoke it.";
+    case "invitation_delivery_unavailable":
+      return "Email delivery was not confirmed. No success is recorded; retry the invitation.";
+    case "invitation_delivery_superseded":
+      return "This invitation changed before delivery completed. Refresh the list and try again.";
+    default:
+      return error.message;
+  }
 }
 
 export function WorkspaceMembers({
@@ -30,6 +87,7 @@ export function WorkspaceMembers({
   const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [invitationsError, setInvitationsError] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [email, setEmail] = useState("");
@@ -38,22 +96,39 @@ export function WorkspaceMembers({
   const [submitting, setSubmitting] = useState(false);
   const [roleDrafts, setRoleDrafts] = useState<Record<number, "admin" | "member">>({});
   const [invitationUrl, setInvitationUrl] = useState<string | null>(null);
+  const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
+  const [resendingId, setResendingId] = useState<number | null>(null);
+  const [consumedDevelopmentLinks, setConsumedDevelopmentLinks] = useState<Set<number>>(
+    () => new Set(),
+  );
+  const invitationAttemptVersions = useRef(new Map<number, number>());
+  const [confirmation, setConfirmation] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    action: () => Promise<void>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
-    try {
-      const [memberResult, invitationResult] = await Promise.all([
-        workspaceApi.listMembers(workspace.id),
-        canManage ? workspaceApi.listInvitations(workspace.id) : Promise.resolve({ invitations: [] }),
-      ]);
-      setMembers(memberResult.members);
-      setInvitations(invitationResult.invitations);
-    } catch (error) {
-      setLoadError(errorMessage(error));
-    } finally {
-      setLoading(false);
+    setInvitationsError(null);
+    const [memberResult, invitationResult] = await Promise.allSettled([
+      workspaceApi.listMembers(workspace.id),
+      canManage ? workspaceApi.listInvitations(workspace.id) : Promise.resolve({ invitations: [] }),
+    ]);
+    if (memberResult.status === "fulfilled") {
+      setMembers(memberResult.value.members);
+    } else {
+      setLoadError(loadErrorMessage(memberResult.reason, "Workspace members"));
     }
+    if (invitationResult.status === "fulfilled") {
+      setInvitations(invitationResult.value.invitations);
+    } else {
+      setInvitations([]);
+      setInvitationsError(loadErrorMessage(invitationResult.reason, "Pending invitations"));
+    }
+    setLoading(false);
   }, [canManage, workspace.id]);
 
   useEffect(() => {
@@ -66,6 +141,7 @@ export function WorkspaceMembers({
     setSuccess(null);
     setFieldError(null);
     setInvitationUrl(null);
+    setDeliveryNotice(null);
     const normalizedEmail = email.trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       setFieldError("Enter a valid email address.");
@@ -74,17 +150,68 @@ export function WorkspaceMembers({
     setSubmitting(true);
     try {
       const result = await workspaceApi.invite(workspace.id, normalizedEmail, role);
+      if (result.delivery_status !== "accepted" && result.delivery_status !== "development_outbox") {
+        setRequestError("Invitation was created but delivery was not confirmed. Retry the invitation.");
+        await load();
+        return;
+      }
       setEmail("");
       setSuccess(result.message);
+      setDeliveryNotice(deliveryNoticeFor(result.delivery_status));
       await load();
     } catch (error) {
       if (error instanceof ApiError && error.fields?.email) {
         setFieldError(error.fields.email);
+      } else if (error instanceof ApiError && error.code === "invitation_delivery_unconfigured") {
+        setRequestError("Invitation delivery is not configured; no invitation was created.");
+      } else if (error instanceof ApiError) {
+        setRequestError(deliveryErrorMessage(error));
+        if (
+          error.code === "invitation_delivery_rejected" ||
+          error.code === "invitation_delivery_unavailable" ||
+          error.code === "invitation_delivery_superseded"
+        ) {
+          await load();
+        }
       } else {
         setRequestError(errorMessage(error));
       }
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function resend(invitation: WorkspaceInvitation) {
+    setRequestError(null);
+    setSuccess(null);
+    setDeliveryNotice(null);
+    setInvitationUrl(null);
+    invitationAttemptVersions.current.set(
+      invitation.id,
+      (invitationAttemptVersions.current.get(invitation.id) ?? 0) + 1,
+    );
+    setResendingId(invitation.id);
+    try {
+      const result = await workspaceApi.resendInvitation(workspace.id, invitation.id);
+      if (result.delivery_status === "accepted" || result.delivery_status === "development_outbox") {
+        setSuccess(result.message);
+        setDeliveryNotice(deliveryNoticeFor(result.delivery_status));
+        if (result.delivery_status === "development_outbox") {
+          setConsumedDevelopmentLinks((current) => {
+            const next = new Set(current);
+            next.delete(invitation.id);
+            return next;
+          });
+        }
+      } else {
+        setRequestError("Invitation was resent but delivery was not confirmed. Retry again if needed.");
+      }
+      await load();
+    } catch (error) {
+      setRequestError(error instanceof ApiError ? deliveryErrorMessage(error) : errorMessage(error));
+      await load();
+    } finally {
+      setResendingId(null);
     }
   }
 
@@ -128,6 +255,7 @@ export function WorkspaceMembers({
   }
 
   async function showDevelopmentLink(invitation: WorkspaceInvitation) {
+    const attempt = invitationAttemptVersions.current.get(invitation.id) ?? 0;
     setRequestError(null);
     setInvitationUrl(null);
     try {
@@ -135,9 +263,30 @@ export function WorkspaceMembers({
         workspace.id,
         invitation.id,
       );
+      if (attempt !== (invitationAttemptVersions.current.get(invitation.id) ?? 0)) {
+        return;
+      }
       setInvitationUrl(result.invitation_url);
+      setConsumedDevelopmentLinks((current) => {
+        const next = new Set(current);
+        next.add(invitation.id);
+        return next;
+      });
     } catch (error) {
-      setRequestError(errorMessage(error));
+      if (attempt !== (invitationAttemptVersions.current.get(invitation.id) ?? 0)) {
+        return;
+      }
+      if (error instanceof ApiError && error.code === "development_link_unavailable") {
+        setConsumedDevelopmentLinks((current) => {
+          const next = new Set(current);
+          next.add(invitation.id);
+          return next;
+        });
+        setRequestError("The local invitation link is no longer available.");
+        await load();
+      } else {
+        setRequestError(errorMessage(error));
+      }
     }
   }
 
@@ -151,8 +300,40 @@ export function WorkspaceMembers({
     }
   }
 
+  function confirmRemove(member: WorkspaceMember) {
+    setConfirmation({
+      title: "Remove member?",
+      message: `${member.name} will lose access to this workspace.`,
+      confirmLabel: "Remove member",
+      action: () => removeMember(member),
+    });
+  }
+
+  function confirmRevoke(invitation: WorkspaceInvitation) {
+    setConfirmation({
+      title: "Revoke invitation?",
+      message: `The invitation for ${invitation.email} will stop working.`,
+      confirmLabel: "Revoke invitation",
+      action: () => revoke(invitation),
+    });
+  }
+
+  function confirmLeave() {
+    setConfirmation({
+      title: "Leave workspace?",
+      message: "You will lose access to this workspace until invited again.",
+      confirmLabel: "Leave workspace",
+      action: leaveWorkspace,
+    });
+  }
+
   return (
-    <section className="workspace-members" aria-labelledby="members-heading">
+    <section
+      id="members-section"
+      tabIndex={-1}
+      className="workspace-members"
+      aria-labelledby="members-heading"
+    >
       <div className="discussion-heading">
         <div>
           <p className="eyebrow">WORKSPACE ACCESS</p>
@@ -172,6 +353,7 @@ export function WorkspaceMembers({
       )}
       {requestError && <p className="error-banner" role="alert">{requestError}</p>}
       {success && <p className="success-banner" role="status">{success}</p>}
+      {deliveryNotice && <p className="success-banner" role="status">{deliveryNotice}</p>}
       {loading ? (
         <p role="status">Loading members…</p>
       ) : !loadError ? (
@@ -218,7 +400,7 @@ export function WorkspaceMembers({
                 {canRemove && (
                   <button
                     className="quiet-button danger-button"
-                    onClick={() => void removeMember(member)}
+                    onClick={() => confirmRemove(member)}
                     type="button"
                   >
                     Remove
@@ -257,13 +439,21 @@ export function WorkspaceMembers({
               <option value="member">Member</option>
               {isOwner && <option value="admin">Admin</option>}
             </select>
-            <button className="primary-button" disabled={submitting} type="submit">
+            <button className="quiet-button" disabled={submitting} type="submit">
               {submitting ? "Creating invitation…" : "Create invitation"}
             </button>
           </form>
           <div>
             <h4>Pending invitations</h4>
-            {invitations.length === 0 ? (
+            {invitationsError && (
+              <div>
+                <p className="error-banner" role="alert">{invitationsError}</p>
+                <button className="quiet-button" onClick={() => void load()} type="button">
+                  Try again
+                </button>
+              </div>
+            )}
+            {invitationsError ? null : invitations.length === 0 ? (
               <p className="workspace-empty">No pending invitations.</p>
             ) : (
               <ul className="workspace-invitation-list">
@@ -272,20 +462,38 @@ export function WorkspaceMembers({
                     <div>
                       <strong>{invitation.email}</strong>
                       <span>{invitation.role} · expires {new Date(invitation.expires_at).toLocaleString()}</span>
+                      <span>{invitationDeliveryLabel(invitation.delivery_status)}</span>
                     </div>
-                    {import.meta.env.DEV && (
+                    {import.meta.env.DEV && invitation.delivery_status === "development_outbox" && (
+                      consumedDevelopmentLinks.has(invitation.id) ? (
+                        <button className="quiet-button" disabled type="button">
+                          Local link already retrieved
+                        </button>
+                      ) : (
+                        <button
+                          className="quiet-button"
+                          disabled={resendingId === invitation.id}
+                          onClick={() => void showDevelopmentLink(invitation)}
+                          type="button"
+                        >
+                          Get local test link
+                        </button>
+                      )
+                    )}
+                    {(isOwner || invitation.role === "member") && (
                       <button
                         className="quiet-button"
-                        onClick={() => void showDevelopmentLink(invitation)}
+                        disabled={resendingId === invitation.id}
+                        onClick={() => void resend(invitation)}
                         type="button"
                       >
-                        Get local test link
+                        {resendingId === invitation.id ? "Retrying email…" : "Retry email"}
                       </button>
                     )}
                     {(isOwner || invitation.role === "member") && (
                       <button
                         className="quiet-button danger-button"
-                        onClick={() => void revoke(invitation)}
+                        onClick={() => confirmRevoke(invitation)}
                         type="button"
                       >
                         Revoke
@@ -314,12 +522,24 @@ export function WorkspaceMembers({
       {!isOwner && (
         <button
           className="quiet-button danger-button"
-          onClick={() => void leaveWorkspace()}
+          onClick={confirmLeave}
           type="button"
         >
           Leave workspace
         </button>
       )}
+      <ConfirmDialog
+        open={confirmation !== null}
+        title={confirmation?.title ?? "Confirm action"}
+        confirmLabel={confirmation?.confirmLabel}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={() => {
+          if (!confirmation) return;
+          void confirmation.action().finally(() => setConfirmation(null));
+        }}
+      >
+        <p>{confirmation?.message}</p>
+      </ConfirmDialog>
     </section>
   );
 }

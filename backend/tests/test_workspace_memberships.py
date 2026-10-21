@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.extensions import db
 from app.models import User, Workspace, WorkspaceInvitation, WorkspaceMembership
+from app.services.invitation_delivery import DeliveryRejected, DeliveryResult, DeliveryUnknown
 
 BASE = "/api/v1"
 WORKSPACES = f"{BASE}/workspaces"
@@ -59,6 +60,21 @@ def invite(client, workspace_id: int, email: str, role: str = "member"):
         json={"email": email, "role": role},
         headers=csrf_headers(client),
     )
+
+
+class FakeInvitationDelivery:
+    def __init__(self, result: DeliveryResult | Exception, on_deliver=None):
+        self.result = result
+        self.on_deliver = on_deliver
+        self.messages = []
+
+    def deliver(self, message):
+        self.messages.append(message)
+        if self.on_deliver is not None:
+            self.on_deliver(message)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
 def test_invitation_normalizes_email_stores_only_hash_and_uses_dev_outbox(client, app):
@@ -155,6 +171,265 @@ def test_invitation_role_permissions_validation_duplicates_and_csrf(client, app)
     assert inaccessible.get_json()["error"] == "workspace_not_found"
 
 
+def test_invitation_is_committed_before_provider_delivery(client, app):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    observed = {}
+
+    def observe(message):
+        invitation = db.session.get(WorkspaceInvitation, message.invitation_id)
+        token = parse_qs(urlparse(message.invitation_url).query)["token"][0]
+        observed["exists"] = invitation is not None
+        observed["delivery_status"] = invitation.delivery_status
+        observed["token_matches"] = (
+            invitation.token_hash == hashlib.sha256(token.encode()).hexdigest()
+        )
+
+    app.extensions["invitation_delivery"] = FakeInvitationDelivery(
+        DeliveryResult("accepted"), on_deliver=observe
+    )
+
+    response = invite(client, workspace.id, "committed@example.test")
+
+    assert response.status_code == 201
+    assert observed == {
+        "exists": True,
+        "delivery_status": "pending",
+        "token_matches": True,
+    }
+
+
+def test_provider_outcomes_are_persisted_without_false_success(client, app):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    fake = FakeInvitationDelivery(DeliveryResult("accepted"))
+    app.extensions["invitation_delivery"] = fake
+
+    accepted = invite(client, workspace.id, "accepted@example.test")
+    assert accepted.status_code == 201
+    accepted_body = accepted.get_json()
+    accepted_invitation = db.session.get(WorkspaceInvitation, accepted_body["invitation"]["id"])
+    assert accepted_body["delivery_status"] == "accepted"
+    assert accepted_invitation.delivery_status == "accepted"
+    assert "token" not in accepted_body["invitation"]
+    assert fake.messages[0].invitation_url.startswith(
+        "http://localhost:5173/accept-invitation?token="
+    )
+    assert db.session.get(WorkspaceInvitation, accepted_invitation.id) is not None
+
+    fake.result = DeliveryRejected()
+    rejected = invite(client, workspace.id, "rejected@example.test")
+    assert rejected.status_code == 502
+    assert rejected.get_json()["error"] == "invitation_delivery_rejected"
+    rejected_invitation = db.session.scalar(
+        select(WorkspaceInvitation).where(WorkspaceInvitation.email == "rejected@example.test")
+    )
+    assert rejected_invitation.delivery_status == "rejected"
+
+    fake.result = DeliveryUnknown()
+    unavailable = invite(client, workspace.id, "unknown@example.test")
+    assert unavailable.status_code == 503
+    assert unavailable.get_json()["error"] == "invitation_delivery_unavailable"
+    unknown_invitation = db.session.scalar(
+        select(WorkspaceInvitation).where(WorkspaceInvitation.email == "unknown@example.test")
+    )
+    assert unknown_invitation.delivery_status == "unknown"
+    assert "token_hash" not in rejected.get_json()["invitation"]
+    assert "token=" not in rejected.get_data(as_text=True)
+
+
+def test_failed_delivery_can_be_retried_without_creating_duplicate_rows(client, app):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    fake = FakeInvitationDelivery(DeliveryRejected())
+    app.extensions["invitation_delivery"] = fake
+
+    rejected = invite(client, workspace.id, "retry-rejected@example.test")
+    rejected_id = rejected.get_json()["invitation"]["id"]
+    fake.result = DeliveryUnknown()
+    unknown = invite(client, workspace.id, "retry-unknown@example.test")
+    unknown_id = unknown.get_json()["invitation"]["id"]
+
+    fake.result = DeliveryResult("accepted")
+    retried_rejected = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{rejected_id}/resend",
+        headers=csrf_headers(client),
+    )
+    retried_unknown = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{unknown_id}/resend",
+        headers=csrf_headers(client),
+    )
+
+    assert retried_rejected.status_code == 200
+    assert retried_unknown.status_code == 200
+    assert db.session.get(WorkspaceInvitation, rejected_id).delivery_status == "accepted"
+    assert db.session.get(WorkspaceInvitation, unknown_id).delivery_status == "accepted"
+    assert (
+        db.session.scalar(
+            select(func.count())
+            .select_from(WorkspaceInvitation)
+            .where(WorkspaceInvitation.workspace_id == workspace.id)
+        )
+        == 2
+    )
+
+
+def test_resend_rotates_token_and_preserves_authorization_and_lifecycle(client, app):
+    owner = create_user("owner@example.test")
+    invitee = create_user("invitee@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    fake = FakeInvitationDelivery(DeliveryResult("accepted"))
+    app.extensions["invitation_delivery"] = fake
+
+    created = invite(client, workspace.id, invitee.email)
+    invitation_id = created.get_json()["invitation"]["id"]
+    first_token = parse_qs(urlparse(fake.messages[-1].invitation_url).query)["token"][0]
+    first_hash = db.session.get(WorkspaceInvitation, invitation_id).token_hash
+
+    resent = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{invitation_id}/resend",
+        headers=csrf_headers(client),
+    )
+    assert resent.status_code == 200
+    second_token = parse_qs(urlparse(fake.messages[-1].invitation_url).query)["token"][0]
+    invitation = db.session.get(WorkspaceInvitation, invitation_id)
+    assert invitation.token_hash != first_hash
+    assert second_token != first_token
+    assert invitation.delivery_status == "accepted"
+
+    invitee_client = app.test_client()
+    login(invitee_client, invitee.email)
+    old_token = invitee_client.post(
+        f"{BASE}/invitations/accept",
+        json={"token": first_token},
+        headers=csrf_headers(invitee_client),
+    )
+    assert old_token.status_code == 404
+    current_token = invitee_client.post(
+        f"{BASE}/invitations/accept",
+        json={"token": second_token},
+        headers=csrf_headers(invitee_client),
+    )
+    assert current_token.status_code == 200
+
+
+def test_resend_requires_empty_body_and_rejects_unavailable_lifecycle(client, app):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    fake = FakeInvitationDelivery(DeliveryResult("accepted"))
+    app.extensions["invitation_delivery"] = fake
+    created = invite(client, workspace.id, "invitee@example.test")
+    invitation_id = created.get_json()["invitation"]["id"]
+
+    body = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{invitation_id}/resend",
+        data="{}",
+        content_type="application/json",
+        headers=csrf_headers(client),
+    )
+    assert body.status_code == 400
+    assert body.get_json()["error"] == "validation_error"
+
+    invitation = db.session.get(WorkspaceInvitation, invitation_id)
+    invitation.status = "revoked"
+    db.session.commit()
+    unavailable = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{invitation_id}/resend",
+        headers=csrf_headers(client),
+    )
+    assert unavailable.status_code == 410
+    assert len(fake.messages) == 1
+
+
+def test_resend_authorization_csrf_workspace_and_expiry_guards(client, app):
+    owner = create_user("owner@example.test")
+    admin = create_user("admin@example.test")
+    other_owner = create_user("other-owner@example.test")
+    workspace = make_workspace(owner, admin=admin)
+    make_workspace(other_owner)
+    login(client, owner.email)
+    fake = FakeInvitationDelivery(DeliveryResult("accepted"))
+    app.extensions["invitation_delivery"] = fake
+
+    admin_invitation = invite(client, workspace.id, "admin-target@example.test", "admin")
+    admin_invitation_id = admin_invitation.get_json()["invitation"]["id"]
+    missing_csrf = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{admin_invitation_id}/resend"
+    )
+    assert missing_csrf.status_code == 403
+
+    admin_client = app.test_client()
+    login(admin_client, admin.email)
+    forbidden_role = admin_client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{admin_invitation_id}/resend",
+        headers=csrf_headers(admin_client),
+    )
+    assert forbidden_role.status_code == 403
+    assert forbidden_role.get_json()["error"] == "permission_denied"
+
+    other_client = app.test_client()
+    login(other_client, other_owner.email)
+    cross_workspace = other_client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{admin_invitation_id}/resend",
+        headers=csrf_headers(other_client),
+    )
+    assert cross_workspace.status_code == 404
+    assert cross_workspace.get_json()["error"] == "workspace_not_found"
+
+    expired = invite(client, workspace.id, "expired-resend@example.test")
+    expired_id = expired.get_json()["invitation"]["id"]
+    invitation = db.session.get(WorkspaceInvitation, expired_id)
+    invitation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.session.commit()
+    delivery_calls_before = len(fake.messages)
+    expired_response = client.post(
+        f"{WORKSPACES}/{workspace.id}/invitations/{expired_id}/resend",
+        headers=csrf_headers(client),
+    )
+
+    assert expired_response.status_code == 410
+    assert expired_response.get_json()["error"] == "invitation_unavailable"
+    assert db.session.get(WorkspaceInvitation, expired_id).status == "expired"
+    assert len(fake.messages) == delivery_calls_before
+
+
+def test_delivery_outcome_commit_failure_is_unknown_without_false_success(client, app, monkeypatch):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    app.extensions["invitation_delivery"] = FakeInvitationDelivery(DeliveryResult("accepted"))
+    commit_calls = 0
+    original_commit = db.session.commit
+
+    def fail_outcome_commit():
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise SQLAlchemyError("injected delivery outcome commit failure")
+        original_commit()
+
+    monkeypatch.setattr(db.session, "commit", fail_outcome_commit)
+    response = invite(client, workspace.id, "outcome-failure@example.test")
+
+    assert response.status_code == 503
+    body = response.get_json()
+    assert body["error"] == "invitation_delivery_unavailable"
+    assert body["delivery_status"] == "unknown"
+    assert "invitation" not in body
+    invitation = db.session.scalar(
+        select(WorkspaceInvitation).where(
+            WorkspaceInvitation.email == "outcome-failure@example.test"
+        )
+    )
+    assert invitation.status == "pending"
+    assert invitation.delivery_status == "pending"
+
+
 def test_invitation_creation_is_disabled_without_a_delivery_adapter(client, app):
     owner = create_user("owner@example.test")
     workspace = make_workspace(owner)
@@ -166,6 +441,23 @@ def test_invitation_creation_is_disabled_without_a_delivery_adapter(client, app)
     assert response.status_code == 503
     assert response.get_json()["error"] == "invitation_delivery_unconfigured"
     assert db.session.scalar(select(func.count()).select_from(WorkspaceInvitation)) == 0
+
+
+def test_invitation_model_server_default_is_conservative(client, app):
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    invitation = WorkspaceInvitation(
+        workspace_id=workspace.id,
+        email="direct@example.test",
+        role="member",
+        token_hash="d" * 64,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+        inviter_id=owner.id,
+        status="pending",
+    )
+    db.session.add(invitation)
+    db.session.commit()
+    assert invitation.delivery_status == "unknown"
 
 
 def test_development_invitation_link_route_is_hidden_outside_development(client, app):
@@ -514,6 +806,59 @@ def test_invitation_creation_rolls_back_on_database_failure(client, monkeypatch)
     assert response.status_code == 500
     assert "injected invitation commit failure" not in response.get_data(as_text=True)
     assert db.session.scalar(select(func.count()).select_from(WorkspaceInvitation)) == 0
+
+
+def test_concurrent_resend_cannot_overwrite_a_newer_attempt_on_postgresql(client, app):
+    if db.engine.dialect.name != "postgresql":
+        pytest.skip("Resend row-lock concurrency is verified by the PostgreSQL integration job.")
+
+    owner = create_user("owner@example.test")
+    workspace = make_workspace(owner)
+    login(client, owner.email)
+    delivery = FakeInvitationDelivery(DeliveryResult("accepted"))
+    app.extensions["invitation_delivery"] = delivery
+    created = invite(client, workspace.id, "resend@example.test")
+    invitation_id = created.get_json()["invitation"]["id"]
+
+    first_started = Event()
+    release_first = Event()
+    original_deliver = delivery.deliver
+    resend_calls = 0
+
+    def block_first_resend(message):
+        nonlocal resend_calls
+        resend_calls += 1
+        if resend_calls == 1:
+            first_started.set()
+            assert release_first.wait(timeout=10)
+        return original_deliver(message)
+
+    delivery.deliver = block_first_resend
+    first_client = app.test_client()
+    second_client = app.test_client()
+    login(first_client, owner.email)
+    login(second_client, owner.email)
+    first_headers = csrf_headers(first_client)
+    second_headers = csrf_headers(second_client)
+
+    def resend_with(client_instance, headers):
+        return client_instance.post(
+            f"{WORKSPACES}/{workspace.id}/invitations/{invitation_id}/resend",
+            headers=headers,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(resend_with, first_client, first_headers)
+        assert first_started.wait(timeout=10)
+        second_future = executor.submit(resend_with, second_client, second_headers)
+        second_response = second_future.result(timeout=10)
+        release_first.set()
+        first_response = first_future.result(timeout=10)
+
+    assert second_response.status_code == 200
+    assert first_response.status_code == 409
+    assert first_response.get_json()["error"] == "invitation_delivery_superseded"
+    assert db.session.get(WorkspaceInvitation, invitation_id).delivery_status == "accepted"
 
 
 def test_concurrent_invitation_acceptance_is_single_use_on_postgresql(client, app):

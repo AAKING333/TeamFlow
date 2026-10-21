@@ -11,12 +11,41 @@ Deploy behind an HTTPS-terminating reverse proxy or managed platform and set:
   least-privilege application role.
 - `FRONTEND_ORIGIN` to the exact HTTPS origin serving the React app
   (scheme and host only; no wildcard, path, credentials, query, or fragment).
+- `INVITATION_EMAIL_PROVIDER=resend` or `INVITATION_EMAIL_PROVIDER=smtp`
+- For `resend`: `INVITATION_EMAIL_FROM` set to a sender verified with Resend
+  (for example, `TeamFlow <no-reply@your-verified-domain.example>`) and
+  `RESEND_API_KEY` from the deployment secret manager; never a tracked `.env`
+  value or placeholder
+- For `smtp`: `INVITATION_EMAIL_FROM`, `SMTP_HOST`, `SMTP_PORT`,
+  `SMTP_SECURITY` (`starttls` for 587, `ssl` for 465), `SMTP_USERNAME`, and
+  `SMTP_PASSWORD` from the deployment secret manager; never a tracked `.env`
+  value or placeholder. TLS certificates are always verified and credentials
+  are never sent unencrypted.
+- `INVITATION_EMAIL_TIMEOUT_SECONDS` between 1 and 30
+
+Gmail can be used through `smtp` with an App Password (2-Step Verification
+required; `INVITATION_EMAIL_FROM` must be the same Gmail address as
+`SMTP_USERNAME`; see [the Gmail guide](development-setup.md#sending-real-invitation-email-with-gmail-smtp)),
+but a personal Gmail account has a low daily sending limit and its messages may
+be filtered to spam, so it suits small or internal deployments, not bulk sending.
+An accepted SMTP message means the server accepted it for delivery, not that it
+reached an inbox. Real delivery is unverified until it has been tested with real
+credentials. After pulling a release that adds migrations, run
+`flask db upgrade` (see below; back up first) on every existing database.
 
 Production startup rejects a missing/short secret, missing or non-PostgreSQL
-database URL, non-HTTPS frontend origin, and debug mode. Session cookies are
-HttpOnly, Secure, SameSite=Lax; mutations continue to require the session-bound
-CSRF header. Configure TLS and trusted proxy headers at the deployment edge.
-No email provider or external notification delivery is configured.
+database URL, non-HTTPS frontend origin, debug mode, and incomplete or
+malformed invitation email settings. Sender verification is performed by
+Resend and must be completed before sending. A provider 4xx rejection (or a
+permanent SMTP 5xx refusal or authentication failure) returns a failed
+invitation delivery; a timeout, redirect, malformed response, SMTP 4xx, or
+transport/5xx failure remains `unknown` and is safe to retry through the
+authenticated resend endpoint. No queue, background retry, inbox-placement
+tracking, or automatic provider retry is included. The existing CSRF,
+workspace authorization, expiry, email matching, one-time acceptance, and
+revocation controls remain the abuse and privacy boundary; no new rate limiter
+is included, so repeated sends by an authorized user remain a documented
+limitation.
 
 Do not start production with `python run.py` or `flask run`; these are
 development servers. Install the backend dependencies and serve the WSGI app
@@ -113,7 +142,7 @@ the archive and drops only those disposable CI databases. A green CI drill is
 evidence for this synthetic PostgreSQL restore path, not proof of a live
 provider's backup policies or a production disaster-recovery process.
 
-The current Alembic head is `d2c4b91e7a63`. First verify the release image's
+The current Alembic head is `f0a1b2c3d4e5`. First verify the release image's
 head and live database revision; then apply the forward migration as a
 separately controlled release step:
 
@@ -194,5 +223,6 @@ temporary SQLite database; its invitation journey uses only the development
 in-memory invitation outbox. Playwright traces and video are disabled to avoid
 retaining one-time invitation URLs. This verifies browser journeys against the
 local Flask/Vite processes, not browser behavior against a deployed origin.
-PostgreSQL backend and restore checks run in a separate PostgreSQL CI job. No
-email provider or external notification delivery is configured.
+PostgreSQL backend and restore checks run in a separate PostgreSQL CI job. The
+invitation provider is not contacted by automated tests; task/comment
+notifications remain in-app only and have no email/SMS/push queue or worker.

@@ -14,6 +14,31 @@ afterEach(() => {
 });
 
 describe("workspace API client", () => {
+  it("exposes the safe error code and misconfiguration reason of delivery failures", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).endsWith("/auth/csrf")
+          ? jsonResponse({ csrf_token: "invite-csrf" })
+          : new Response(
+              JSON.stringify({
+                error: "invitation_delivery_rejected",
+                message: "Invitation email delivery is misconfigured on the server.",
+                delivery_status: "rejected",
+                reason: "misconfigured",
+              }),
+              { status: 502, headers: { "Content-Type": "application/json" } },
+            ),
+      ),
+    );
+
+    await expect(workspaceApi.invite(4, "invitee@example.test", "member")).rejects.toMatchObject({
+      status: 502,
+      code: "invitation_delivery_rejected",
+      reason: "misconfigured",
+    });
+  });
+
   it("uses credentialed requests and fetches a CSRF token before creation", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     vi.stubGlobal(
@@ -111,6 +136,7 @@ describe("workspace API client", () => {
                 role: "member",
                 inviter: null,
                 status: "pending",
+                delivery_status: "development_outbox",
                 created_at: "2026-10-12T00:00:00+00:00",
                 expires_at: "2026-10-19T00:00:00+00:00",
               },
@@ -127,5 +153,12 @@ describe("workspace API client", () => {
     expect(calls[1].init?.body).toBe(
       JSON.stringify({ email: "new@example.test", role: "member" }),
     );
+
+    await workspaceApi.resendInvitation(4, 2);
+    const resend = calls[calls.length - 1];
+    expect(resend.url).toMatch(/\/workspaces\/4\/invitations\/2\/resend$/);
+    expect(resend.init?.method).toBe("POST");
+    expect(resend.init?.body).toBeUndefined();
+    expect(new Headers(resend.init?.headers).get("X-CSRF-Token")).toBe("invite-csrf");
   });
 });

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
+import { buildBackendServerEnvironment, buildFrontendServerEnvironment } from "./environment.mjs";
 
 const frontendRoot = resolve(import.meta.dirname, "..");
 const backendRoot = resolve(frontendRoot, "..", "backend");
@@ -18,13 +19,9 @@ if (!databaseUrl?.startsWith("sqlite:///")) {
   throw new Error("The browser E2E server requires its generated SQLite database URL.");
 }
 
-const environment = {
-  ...process.env,
-  APP_CONFIG: "development",
-  DATABASE_URL: databaseUrl,
-  FRONTEND_ORIGIN: "http://127.0.0.1:5173",
-  VITE_API_BASE_URL: "http://127.0.0.1:5000/api/v1",
-};
+// Allowlisted environments only: SMTP_*, INVITATION_EMAIL_FROM and RESEND_API_KEY are
+// never inherited, backend/.env is never read, and the backend uses the local outbox.
+const environment = buildBackendServerEnvironment(process.env, databaseUrl);
 
 for (const migrationCommand of [
   ["upgrade"],
@@ -84,7 +81,7 @@ const vite = spawn(
   ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
   {
     cwd: frontendRoot,
-    env: environment,
+    env: buildFrontendServerEnvironment(process.env),
     stdio: "inherit",
   },
 );

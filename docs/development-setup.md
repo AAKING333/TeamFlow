@@ -115,11 +115,15 @@ against a freshly migrated temporary SQLite database.
 
 ## Browser origin and authentication
 
-The local React development origin is `http://localhost:5173`; the API is
-`http://localhost:5000`. Configure `FRONTEND_ORIGIN` to the exact frontend
-origin. The API permits credentialed requests only from that origin. Use
-`fetch(..., { credentials: "include" })` and send the session-bound
-`X-CSRF-Token` header on state-changing authentication requests. See
+The local React development origin is normally `http://localhost:5173` (or
+`http://127.0.0.1:5173`); the backend listens on port 5000. With the normal
+Vite setup, the frontend uses the same-origin `/api/v1` path and Vite proxies
+it to the local backend, preserving credentialed cookies and response status.
+Configure `FRONTEND_ORIGIN` to the exact frontend origin for direct
+cross-origin API requests and generated invitation URLs. The API permits
+credentialed cross-origin requests only from that origin. Use `fetch(...,
+{ credentials: "include" })` and send the session-bound `X-CSRF-Token` header
+on state-changing authentication requests. See
 [authentication.md](authentication.md) for lifecycle and security details.
 
 ## Running the backend locally
@@ -130,9 +134,10 @@ $env:APP_CONFIG = "development"
 ..\.venv\Scripts\python.exe run.py
 ```
 
-The local API base URL is `http://localhost:5000/api/v1`.
-Workspace API behavior and role rules are described in
-[workspaces.md](workspaces.md).
+The backend listens at `http://127.0.0.1:5000`; the normal frontend API path
+is `/api/v1` through the Vite development proxy. Set an absolute
+`VITE_API_BASE_URL` only for an intentional separate API host. Workspace API
+behavior and role rules are described in [workspaces.md](workspaces.md).
 
 ## Browser smoke tests
 
@@ -161,23 +166,21 @@ npm --prefix frontend run e2e
 Remove-Item Env:E2E_PYTHON
 ```
 
-The runner creates a uniquely named SQLite database under the operating
-system's temporary directory, applies the migrations, checks schema drift,
-downgrades and re-upgrades that isolated database, and starts Flask and Vite on
-loopback only. It removes the temporary database after Playwright stops the
-servers. It does not use or migrate
-`backend\teamflow.db`; do not change the launcher to use a developer or
-production URL. The suite covers registration/login/logout, workspace and
-project creation, invitation acceptance via the development-only in-memory
-outbox, member role restrictions, task status/priority/assignment, comments,
-notification navigation, non-member access denial, and workspace switching.
-Passwords and the one-time invitation URL are generated at runtime and are not
-written to the test report. Traces and video are disabled.
-
-On failure, Playwright writes a report and a screenshot under
-`frontend\playwright-report` and `frontend\test-results`. Review and remove
-these local diagnostics after use; they can include the synthetic test account
-names and project/task content.
+The runner creates a uniquely named SQLite database and a separate uniquely
+owned artifact directory under the operating system's temporary directory,
+applies the migrations, checks schema drift, downgrades and re-upgrades that
+isolated database, and starts Flask and Vite on loopback only. It removes only
+that run's temporary directory after Playwright stops the servers. It does not
+use or migrate `backend\teamflow.db`; do not change the launcher to use a
+developer or production URL. The suite covers registration/login/logout,
+workspace and project creation, invitation acceptance via the development-only
+in-memory outbox, member role restrictions, task status/priority/assignment,
+comments, notification navigation, non-member access denial, and workspace
+switching. Passwords and the one-time invitation URL are generated at runtime.
+The runner passes an allowlisted environment to the test processes, forces the
+development outbox, disables traces/video/screenshots, and scans only its owned
+artifacts for raw, percent-encoded, HTML-escaped, or JSON bearer URL forms
+before cleanup.
 
 ## Running the frontend
 
@@ -188,10 +191,12 @@ cd D:\TeamFlow\frontend
 npm run dev
 ```
 
-Vite uses `http://localhost:5173`; the default frontend API URL is
-`http://localhost:5000/api/v1`. Copy `.env.example` to `.env.local` only if
-overriding that URL. The backend's `FRONTEND_ORIGIN` must exactly match the
-browser origin.
+Vite uses `http://localhost:5173` (or `http://127.0.0.1:5173`). Leave
+`VITE_API_BASE_URL` unset for the default same-origin `/api/v1` path, which the
+Vite development proxy forwards to `http://127.0.0.1:5000`. Set an absolute
+`VITE_API_BASE_URL` in `.env.local` only for an intentional separate API host.
+The backend's `FRONTEND_ORIGIN` remains an exact-origin rule for direct
+cross-origin requests and generated invitation URLs.
 
 ## Database migrations
 
@@ -206,18 +211,120 @@ $env:APP_CONFIG = "development"
 
 `db upgrade` applies schema changes to the database selected by `APP_CONFIG` and `DATABASE_URL`. Do not run it with production configuration unless the deployment procedure explicitly calls for it.
 
-The current Alembic head is `d2c4b91e7a63`. Existing local databases are not
+The current Alembic head is `f0a1b2c3d4e5`. Existing local databases are not
 migrated automatically. For safe backup, effective URL inspection with
 credentials hidden, revision inspection, and manual upgrade steps for an
 existing SQLite database, follow [deployment.md](deployment.md#safe-local-sqlite-upgrade).
 Migration verification must use an isolated test database; it must not alter
 the existing local SQLite file.
 
-No email provider is configured, so invitations do not send email. For local
-testing, create an invitation in the app and use its one-time **Get local test
-link** action while the backend is running in development mode. The link is
-held in process memory and is not included in ordinary API responses or logs.
-The local outbox is cleared when the backend restarts.
+Workspace invitation email configuration
+---------------------------------------
+
+Development and testing must use the explicit no-network mode:
+`INVITATION_EMAIL_PROVIDER=development`. Creating an invitation stores its
+hashed token and keeps the raw link only in the backend process; an authorized
+workspace owner/admin can use the one-time **Get local test link** action. No
+email is sent, and the local outbox is cleared when the backend restarts.
+Automated tests inject/mock delivery or use this outbox and never contact
+Resend or an SMTP server. The isolated browser runner removes provider and SMTP
+credentials from its child environments, never reads `backend\.env`, forces
+the outbox, and uses a disposable database/artifact directory.
+
+Real email uses `INVITATION_EMAIL_PROVIDER=smtp` (Gmail or any SMTP server,
+described below) or `INVITATION_EMAIL_PROVIDER=resend` (needs a verified
+sending domain). Production must set one of them, a valid
+`INVITATION_EMAIL_FROM` sender, the matching secret-managed credentials, and an
+`INVITATION_EMAIL_TIMEOUT_SECONDS` value from 1 through 30. `FRONTEND_ORIGIN`
+must be the exact HTTPS frontend origin used by the acceptance link. Startup
+fails clearly for missing, placeholder, malformed, or unsupported settings;
+there is no fallback to the development link. A provider or SMTP server
+accepting a message means only that it accepted it for delivery, not that it
+reached the inbox. Rejection is shown as a failed delivery and a timeout or
+transport failure is shown as unconfirmed; use the authenticated Retry email
+action, or revoke the invitation, rather than assuming success.
+
+Sending real invitation email with Gmail (SMTP)
+-----------------------------------------------
+
+Until you set this up, **no email is sent**: the development outbox only keeps
+a local link. To send real invitations from your own Gmail account:
+
+1. Turn on 2-Step Verification (Google Account > Security > 2-Step
+   Verification).
+2. Create an App Password (Google Account > Security > App passwords). Google
+   shows it as 16 characters in four groups; TeamFlow ignores the spaces. It is
+   a secret: put it only in `backend\.env`, never in a tracked file, an issue,
+   or a chat.
+3. Create `backend\.env` (`Copy-Item backend\.env.example backend\.env` if you
+   have not yet) and set these values, replacing every placeholder:
+
+   ```text
+   INVITATION_EMAIL_PROVIDER=smtp
+   INVITATION_EMAIL_FROM=TeamFlow <your-address@gmail.com>
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_SECURITY=starttls
+   SMTP_USERNAME=your-address@gmail.com
+   SMTP_PASSWORD=replace-with-a-gmail-app-password
+   ```
+
+   `INVITATION_EMAIL_FROM` must be the same Gmail address as `SMTP_USERNAME`
+   (or a "Send mail as" alias you verified in Gmail). Use `SMTP_PORT=465` with
+   `SMTP_SECURITY=ssl` if port 587 is blocked on your network. `backend\.env`
+   is git-ignored; save it as UTF-8 and check `git status` shows it as ignored.
+4. Restart the backend: press Ctrl+C in its terminal and run `python run.py`
+   again from `D:\TeamFlow\backend`. Settings are read only at startup. If a
+   setting is missing, a placeholder, or unsafe, the backend refuses to start
+   and names the setting (never its value).
+5. Run an intentional end-to-end test: sign in, open the Members panel, and
+   invite an address you control. TeamFlow reports that the email was handed to
+   the email server. Check that mailbox, including spam, then open the link and
+   accept the invitation with an account using that address. Real delivery is
+   not proven until you have done this with your own credentials; the automated
+   tests use a fake SMTP server and never send email.
+
+Things to expect: Gmail limits how many messages an account may send per day
+(see Google's [Gmail sending limits](https://support.google.com/mail/answer/22839)
+and, for Workspace, [its limits](https://support.google.com/a/answer/166852));
+messages from a personal address may be filtered to spam; and an invitation
+shown as "Email provider accepted" only means the server accepted it.
+
+Troubleshooting (the backend log shows only a category such as
+`category=authentication`; never the password, address, or link):
+
+- `535` / "Username and Password not accepted": the Members panel says email
+  delivery is misconfigured. Recreate the App Password, confirm
+  `SMTP_USERNAME` is the full Gmail address, and restart the backend.
+- No "App passwords" option: Google hides it when 2-Step Verification is off or
+  uses only security keys, for Advanced Protection accounts, and for accounts
+  whose administrator disabled it ([Google's help](https://support.google.com/mail/answer/185833)).
+- Google Workspace (work or school) accounts often need administrator
+  permission for App passwords or SMTP access, and some require OAuth, which
+  TeamFlow does not use. Use a personal Gmail account or another SMTP provider.
+- Timeouts or "delivery was not confirmed": a firewall, VPN, or antivirus may
+  block outbound port 587; try 465/`ssl`. Categories `timeout`, `connection`,
+  `dns`, and `tls` point to the network. TLS certificates are always verified
+  and cannot be disabled; an intercepting proxy or a wrong system clock fails
+  the check.
+- Settings seem ignored: the file must be exactly `backend\.env` (not
+  `.env.txt`), and a variable already set in your PowerShell session overrides
+  the file (`Remove-Item Env:SMTP_PASSWORD`).
+
+After pulling changes that add migrations, run `flask db upgrade` (with a
+backup) on your existing development database; see
+[deployment.md](deployment.md#safe-local-sqlite-upgrade). Tests use fresh
+in-memory databases and do not exercise your real development database, so they
+can pass while the Members panel fails on a database that is behind.
+
+A deliberate live-provider smoke test is not part of automated verification.
+If one is separately authorized, use an isolated disposable database, valid
+secret-managed credentials, a verified sender, a controlled recipient, and
+`INVITATION_EMAIL_PROVIDER=resend` or `smtp`; verify only provider or server
+acceptance, never inbox placement, and remove any resulting invitation
+afterward. Do not
+put credentials, raw tokens, or bearer URLs in logs, fixtures, reports, or
+documentation.
 
 ## Running tests
 

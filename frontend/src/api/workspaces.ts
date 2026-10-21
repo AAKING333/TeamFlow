@@ -1,6 +1,12 @@
 import { apiRequest, csrfHeaders } from "./client";
 
 export type WorkspaceRole = "owner" | "admin" | "member";
+export type InvitationDeliveryStatus =
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "unknown"
+  | "development_outbox";
 
 export interface Workspace {
   id: number;
@@ -25,6 +31,7 @@ export interface WorkspaceInvitation {
   role: Exclude<WorkspaceRole, "owner">;
   inviter: { id: number; name: string } | null;
   status: "pending" | "accepted" | "revoked" | "expired";
+  delivery_status: InvitationDeliveryStatus;
   created_at: string;
   expires_at: string;
 }
@@ -68,7 +75,7 @@ export const workspaceApi = {
   async invite(workspaceId: number, email: string, role: "admin" | "member") {
     return apiRequest<{
       invitation: WorkspaceInvitation;
-      delivery_status: "not_configured" | "development_outbox";
+      delivery_status: InvitationDeliveryStatus;
       message: string;
     }>(`/workspaces/${workspaceId}/invitations`, {
       method: "POST",
@@ -82,6 +89,17 @@ export const workspaceApi = {
       `/workspaces/${workspaceId}/invitations`,
       { cache: "no-store" },
     );
+  },
+
+  async resendInvitation(workspaceId: number, invitationId: number) {
+    return apiRequest<{
+      invitation: WorkspaceInvitation;
+      delivery_status: InvitationDeliveryStatus;
+      message: string;
+    }>(`/workspaces/${workspaceId}/invitations/${invitationId}/resend`, {
+      method: "POST",
+      headers: await csrfHeaders(),
+    });
   },
 
   async revokeInvitation(workspaceId: number, invitationId: number) {

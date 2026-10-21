@@ -10,6 +10,8 @@ from .api import register_blueprints
 from .config import get_config, validate_runtime_config
 from .extensions import db, migrate
 from .services.invitation_delivery import DevelopmentInvitationOutbox
+from .services.resend_delivery import ResendDelivery
+from .services.smtp_delivery import SmtpDelivery
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +71,29 @@ def create_app(config_name: str | None = None) -> Flask:
 
     db.init_app(app)
     migrate.init_app(app, db)
-    if selected_config in {"development", "testing"}:
+    if selected_config == "testing" or (
+        selected_config == "development"
+        and app.config["INVITATION_EMAIL_PROVIDER"] == "development"
+    ):
         app.extensions["invitation_delivery"] = DevelopmentInvitationOutbox()
+    elif app.config["INVITATION_EMAIL_PROVIDER"] in {"resend", "smtp"}:
+        from .config import InvitationEmailSettings
+
+        settings = InvitationEmailSettings(
+            provider=app.config["INVITATION_EMAIL_PROVIDER"],
+            sender=app.config["INVITATION_EMAIL_FROM"],
+            api_key=app.config["RESEND_API_KEY"],
+            timeout_seconds=app.config["INVITATION_EMAIL_TIMEOUT_SECONDS"],
+            smtp_host=app.config["SMTP_HOST"],
+            smtp_port=app.config["SMTP_PORT"],
+            smtp_security=app.config["SMTP_SECURITY"],
+            smtp_username=app.config["SMTP_USERNAME"],
+            smtp_password=app.config["SMTP_PASSWORD"],
+        )
+        if settings.provider == "smtp":
+            app.extensions["invitation_delivery"] = SmtpDelivery(settings)
+        else:
+            app.extensions["invitation_delivery"] = ResendDelivery(settings)
     CORS(
         app,
         resources={r"/api/*": {"origins": [app.config["FRONTEND_ORIGIN"]]}},

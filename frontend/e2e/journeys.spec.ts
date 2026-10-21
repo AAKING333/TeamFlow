@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { BrowserContext, Page } from "@playwright/test";
 
 const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
@@ -94,7 +94,10 @@ test("completes collaboration journeys and isolates workspace data", async ({ br
   const invitationUrl = await page.getByLabel("One-time local invitation link").inputValue();
   await page.getByRole("button", { name: "Clear link" }).click();
 
-  const memberContext = await browser.newContext();
+  const contexts: BrowserContext[] = [];
+  try {
+    const memberContext = await browser.newContext();
+    contexts.push(memberContext);
   const memberPage = await memberContext.newPage();
   await memberPage.goto(invitationUrl);
   await expect(memberPage.getByRole("heading", { name: "Join a workspace" })).toBeVisible();
@@ -122,8 +125,8 @@ test("completes collaboration journeys and isolates workspace data", async ({ br
   const { task } = await taskResponse.json() as { task: { id: number } };
   const taskCard = page.getByRole("button", { name: new RegExp(taskTitle) });
   await taskCard.click();
-  await page.getByLabel("Status").selectOption("in_progress");
-  await page.getByLabel("Priority").selectOption("high");
+  await page.getByLabel("Status", { exact: true }).selectOption("in_progress");
+  await page.getByLabel("Priority", { exact: true }).selectOption("high");
   await expect(
     page.getByRole("region", { name: "In Progress tasks" }).getByText(taskTitle),
   ).toBeVisible();
@@ -136,9 +139,9 @@ test("completes collaboration journeys and isolates workspace data", async ({ br
 
   await page.getByRole("button", { name: "Refresh tasks" }).click();
   await expect(
-    page.getByLabel("Assignee").getByRole("option", { name: "Workspace Member" }),
+    page.getByLabel("Assignee", { exact: true }).getByRole("option", { name: "Workspace Member" }),
   ).toBeAttached();
-  await page.getByLabel("Assignee").selectOption({ label: "Workspace Member" });
+  await page.getByLabel("Assignee", { exact: true }).selectOption({ label: "Workspace Member" });
   await expect(page.getByRole("button", { name: new RegExp(`Assigned to Workspace Member`) }))
     .toBeVisible();
   const notificationToggle = memberPage.getByRole("button", { name: /Notifications/ });
@@ -154,6 +157,7 @@ test("completes collaboration journeys and isolates workspace data", async ({ br
   await expect(notificationToggle).toHaveAccessibleName("Notifications");
 
   const outsiderContext = await browser.newContext();
+    contexts.push(outsiderContext);
   const outsiderPage = await outsiderContext.newPage();
   await registerAccount(outsiderPage, "Workspace Outsider", outsiderEmail, outsiderPassword);
   await signIn(outsiderPage, outsiderEmail, outsiderPassword);
@@ -179,6 +183,7 @@ test("completes collaboration journeys and isolates workspace data", async ({ br
   await page.getByRole("button", { name: new RegExp(taskTitle) }).click();
   await expect(page.getByText(commentBody)).toBeVisible();
 
-  await outsiderContext.close();
-  await memberContext.close();
+  } finally {
+    await Promise.all(contexts.map((context) => context.close()));
+  }
 });
