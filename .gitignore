@@ -45,6 +45,7 @@ frontend/test-results/
 *.log
 *.sqlite3
 *.db
+*.db.bak-*
 
 # Git
 .gitkeep

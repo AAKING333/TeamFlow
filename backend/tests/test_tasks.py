@@ -323,8 +323,6 @@ def test_database_rejects_invalid_task_enum_and_assignee_references(app):
     project_id = project.id
     db.session.commit()
 
-    if db.engine.dialect.name == "sqlite":
-        db.session.execute(db.text("PRAGMA foreign_keys=ON"))
     invalid_rows = (
         {
             "project_id": project_id,

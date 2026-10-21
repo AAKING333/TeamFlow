@@ -372,8 +372,6 @@ def test_database_constraints_prevent_orphan_and_oversized_project_data(app):
     workspace = create_workspace(owner)
     db.session.commit()
 
-    if db.engine.dialect.name == "sqlite":
-        db.session.execute(db.text("PRAGMA foreign_keys=ON"))
     db.session.add(Project(workspace_id=workspace.id + 100, name="Orphan"))
     try:
         db.session.flush()
