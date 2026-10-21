@@ -1,8 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { Task } from "../api/tasks";
 import type { Workspace } from "../api/workspaces";
-import { ProjectPanel } from "./ProjectPanel";
+import { WorkspaceOverview } from "./WorkspaceOverview";
 
 const { projectApi, taskApi } = vi.hoisted(() => ({
   projectApi: {
@@ -54,9 +55,27 @@ function makeProject(id: number, workspaceId: number, name: string) {
   };
 }
 
+function makeTask(id: number, projectId: number, title: string): Task {
+  return {
+    id,
+    project_id: projectId,
+    title,
+    description: null,
+    status: "todo",
+    priority: "medium",
+    due_date: null,
+    assignee_id: null,
+    assignee: null,
+    created_at: "2026-10-11T00:00:00+00:00",
+    updated_at: "2026-10-11T00:00:00+00:00",
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   taskApi.list.mockResolvedValue({ tasks: [], assignees: [] });
+  taskApi.listComments.mockResolvedValue({ comments: [] });
+  taskApi.listActivity.mockResolvedValue({ activities: [] });
 });
 
 afterEach(() => {
@@ -69,7 +88,7 @@ describe("workspace projects", () => {
       projects: [makeProject(5, 1, "Roadmap")],
     });
 
-    render(<ProjectPanel workspace={makeWorkspace(1, "Research")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(1, "Research")} />);
 
     expect(await screen.findByRole("heading", { name: "Roadmap" })).toBeVisible();
     expect(screen.getByText("Roadmap details")).toBeVisible();
@@ -86,7 +105,7 @@ describe("workspace projects", () => {
       }),
     );
 
-    render(<ProjectPanel workspace={makeWorkspace(1, "Research")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(1, "Research")} />);
     expect(screen.getByRole("status")).toHaveTextContent("Loading projects");
     resolveList?.({ projects: [] });
     expect(await screen.findByText("No projects in this workspace yet.")).toBeVisible();
@@ -95,7 +114,7 @@ describe("workspace projects", () => {
   it("shows an empty state and hides project creation for members", async () => {
     projectApi.list.mockResolvedValue({ projects: [] });
 
-    render(<ProjectPanel workspace={makeWorkspace(1, "Research", "member")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(1, "Research", "member")} />);
 
     expect(await screen.findByText("No projects in this workspace yet.")).toBeVisible();
     expect(screen.queryByLabelText("New project name")).not.toBeInTheDocument();
@@ -105,7 +124,7 @@ describe("workspace projects", () => {
   it("shows server errors without exposing administrative form controls", async () => {
     projectApi.list.mockRejectedValue(new Error("Projects are temporarily unavailable."));
 
-    render(<ProjectPanel workspace={makeWorkspace(1, "Research", "member")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(1, "Research", "member")} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Projects are temporarily unavailable.",
@@ -119,7 +138,7 @@ describe("workspace projects", () => {
       project: makeProject(8, 2, "Launch"),
     });
 
-    render(<ProjectPanel workspace={makeWorkspace(2, "Product", "admin")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(2, "Product", "admin")} />);
     await screen.findByText("No projects in this workspace yet.");
     fireEvent.change(screen.getByLabelText("New project name"), {
       target: { value: " Launch " },
@@ -139,7 +158,7 @@ describe("workspace projects", () => {
   it("validates project names before sending a request", async () => {
     projectApi.list.mockResolvedValue({ projects: [] });
 
-    render(<ProjectPanel workspace={makeWorkspace(1, "Research")} />);
+    render(<WorkspaceOverview workspace={makeWorkspace(1, "Research")} />);
     await screen.findByText("No projects in this workspace yet.");
     fireEvent.click(screen.getByRole("button", { name: "Create project" }));
 
@@ -152,11 +171,11 @@ describe("workspace projects", () => {
       projects: [makeProject(workspaceId * 10, workspaceId, `Project ${workspaceId}`)],
     }));
     const { rerender } = render(
-      <ProjectPanel workspace={makeWorkspace(1, "Research")} />,
+      <WorkspaceOverview workspace={makeWorkspace(1, "Research")} />,
     );
     expect(await screen.findByRole("heading", { name: "Project 1" })).toBeVisible();
 
-    rerender(<ProjectPanel workspace={makeWorkspace(2, "Product")} />);
+    rerender(<WorkspaceOverview workspace={makeWorkspace(2, "Product")} />);
 
     expect(await screen.findByRole("heading", { name: "Project 2" })).toBeVisible();
     await waitFor(() => expect(projectApi.list).toHaveBeenCalledTimes(2));
@@ -164,8 +183,59 @@ describe("workspace projects", () => {
     expect(projectApi.list).toHaveBeenNthCalledWith(2, 2);
   });
 
+  it("updates notification targets within a workspace without reloading projects", async () => {
+    const firstProject = makeProject(10, 1, "Project A");
+    const secondProject = makeProject(20, 1, "Project B");
+    projectApi.list.mockResolvedValue({ projects: [firstProject, secondProject] });
+    taskApi.list.mockImplementation(async (_workspaceId: number, projectId: number) => ({
+      tasks:
+        projectId === firstProject.id
+          ? [makeTask(101, firstProject.id, "Task A")]
+          : [makeTask(202, secondProject.id, "Task B")],
+      assignees: [],
+    }));
+
+    const { rerender } = render(
+      <WorkspaceOverview
+        workspace={makeWorkspace(1, "Research")}
+        targetProjectId={firstProject.id}
+        targetTaskId={101}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Project A" })).toBeVisible();
+    expect(await screen.findByDisplayValue("Task A")).toBeVisible();
+    expect(projectApi.list).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <WorkspaceOverview
+        workspace={makeWorkspace(1, "Research")}
+        targetProjectId={secondProject.id}
+        targetTaskId={202}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Project B" })).toBeVisible();
+    expect(await screen.findByDisplayValue("Task B")).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Select a project" })).toHaveValue("20");
+    expect(projectApi.list).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <WorkspaceOverview
+        workspace={makeWorkspace(1, "Research")}
+        targetProjectId={999}
+        targetTaskId={999}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Select a project" })).toHaveValue("20");
+      expect(screen.queryByLabelText("Title")).not.toBeInTheDocument();
+    });
+  });
+
   it("does not render project data when no workspace is selected", () => {
-    render(<ProjectPanel workspace={null} />);
+    render(<WorkspaceOverview workspace={null} />);
 
     expect(screen.getByText("Select or create a workspace to view projects.")).toBeVisible();
     expect(projectApi.list).not.toHaveBeenCalled();

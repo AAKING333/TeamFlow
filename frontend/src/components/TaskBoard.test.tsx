@@ -140,16 +140,45 @@ describe("project task board", () => {
     fireEvent.change(screen.getByLabelText("Assignee"), {
       target: { value: "8" },
     });
+    await waitFor(() =>
+      expect(taskApi.update).toHaveBeenCalledWith(2, 4, 1, { assignee_id: 8 }),
+    );
     fireEvent.change(screen.getByLabelText("Title"), {
       target: { value: "Release reviewed" },
     });
-    fireEvent.blur(screen.getByLabelText("Title"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
       expect(taskApi.update).toHaveBeenCalledWith(2, 4, 1, { title: "Release reviewed" }),
     );
     expect(taskApi.update).toHaveBeenCalledWith(2, 4, 1, { priority: "low" });
     expect(taskApi.update).toHaveBeenCalledWith(2, 4, 1, { assignee_id: 8 });
+    expect(await screen.findByRole("status")).toHaveTextContent("Task changes saved.");
+  });
+
+  it("restores the server draft when Cancel changes is pressed", async () => {
+    const existing = makeTask(1, 4, "Original title");
+    taskApi.list.mockResolvedValue({ tasks: [existing], assignees: [] });
+    render(<TaskBoard workspace={makeWorkspace(2)} projectId={4} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Original title/ }));
+    const titleInput = screen.getByLabelText("Title");
+    fireEvent.change(titleInput, { target: { value: "Unsaved title" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel changes" }));
+    expect(titleInput).toHaveValue("Original title");
+    expect(taskApi.update).not.toHaveBeenCalled();
+  });
+
+  it("retains edited draft values after a failed save", async () => {
+    const existing = makeTask(1, 4, "Original title");
+    taskApi.list.mockResolvedValue({ tasks: [existing], assignees: [] });
+    taskApi.update.mockRejectedValue(new Error("Task save failed."));
+    render(<TaskBoard workspace={makeWorkspace(2)} projectId={4} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Original title/ }));
+    const titleInput = screen.getByLabelText("Title");
+    fireEvent.change(titleInput, { target: { value: "Unsaved title" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Task save failed.");
+    expect(titleInput).toHaveValue("Unsaved title");
   });
 
   it("shows load errors and retries", async () => {
@@ -232,6 +261,7 @@ describe("project task board", () => {
     expect(taskApi.updateComment).toHaveBeenCalledWith(2, 4, 1, 10, "Edited note");
 
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete comment" }));
     await waitFor(() =>
       expect(screen.queryByText("Edited note", { selector: "p" })).not.toBeInTheDocument(),
     );

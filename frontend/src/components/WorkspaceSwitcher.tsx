@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { ApiError } from "../api/client";
 import { workspaceApi, type Workspace } from "../api/workspaces";
-import { ProjectPanel } from "./ProjectPanel";
+import { WorkspaceOverview, type FocusTarget } from "./WorkspaceOverview";
 import { WorkspaceMembers } from "./WorkspaceMembers";
 
 function errorMessage(error: unknown) {
@@ -13,7 +13,12 @@ function errorMessage(error: unknown) {
     : "Workspaces could not be loaded. Try again.";
 }
 
-export function WorkspaceSwitcher() {
+interface WorkspaceSwitcherProps {
+  membersOpen?: boolean;
+  onMembersOpenChange?: (open: boolean) => void;
+}
+
+export function WorkspaceSwitcher({ membersOpen, onMembersOpenChange }: WorkspaceSwitcherProps = {}) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [notificationTarget, setNotificationTarget] = useState<{
     workspaceId: number | null;
@@ -29,6 +34,25 @@ export function WorkspaceSwitcher() {
   const [requestError, setRequestError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
+  const focusTargets = useRef(new Map<FocusTarget, () => void>());
+  const registerFocusTarget = useCallback((target: FocusTarget, focus: () => void) => {
+    focusTargets.current.set(target, focus);
+    return () => {
+      if (focusTargets.current.get(target) === focus) focusTargets.current.delete(target);
+    };
+  }, []);
+  const focusTarget = useCallback((target: FocusTarget) => {
+    const focus = focusTargets.current.get(target);
+    if (!focus) return false;
+    focus();
+    return true;
+  }, []);
+  const membersVisible = membersOpen ?? showMembers;
+
+  function setMembersVisible(open: boolean) {
+    setShowMembers(open);
+    onMembersOpenChange?.(open);
+  }
 
   const loadWorkspaces = useCallback(async () => {
     setLoading(true);
@@ -163,12 +187,12 @@ export function WorkspaceSwitcher() {
               <>
                 <button
                   className="quiet-button"
-                  onClick={() => setShowMembers((current) => !current)}
+                  onClick={() => setMembersVisible(!membersVisible)}
                   type="button"
                 >
-                  {showMembers ? "Close member management" : "Manage members"}
+                  {membersVisible ? "Close member management" : "Manage members"}
                 </button>
-                {showMembers && (
+                {membersVisible && (
                   <WorkspaceMembers
                     key={selectedWorkspace.id}
                     workspace={selectedWorkspace}
@@ -184,15 +208,22 @@ export function WorkspaceSwitcher() {
             </p>
           )}
 
-          <ProjectPanel
+          <WorkspaceOverview
             workspace={selectedWorkspace ?? null}
+            workspaceCount={workspaces.length}
             targetProjectId={notificationTarget.projectId}
             targetTaskId={notificationTarget.taskId}
+            registerFocusTarget={registerFocusTarget}
+            focusTarget={focusTarget}
           />
 
           <form className="workspace-create-form" onSubmit={handleCreate} noValidate>
             <label htmlFor="workspace-name">New workspace name</label>
             <input
+              ref={(element) => {
+                if (!element) return undefined;
+                return registerFocusTarget("workspace-name", () => element.focus());
+              }}
               id="workspace-name"
               autoComplete="off"
               maxLength={120}
@@ -212,7 +243,7 @@ export function WorkspaceSwitcher() {
               </p>
             )}
             <button
-              className="primary-button"
+              className="quiet-button"
               disabled={submitting}
               type="submit"
             >

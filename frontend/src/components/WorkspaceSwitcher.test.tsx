@@ -162,6 +162,33 @@ describe("workspace selection", () => {
     expect(projectApi.list).toHaveBeenNthCalledWith(2, 2);
   });
 
+  it("does not request the previous project under the new workspace", async () => {
+    workspaceApi.list.mockResolvedValue({
+      workspaces: [makeWorkspace(1, "Research"), makeWorkspace(2, "Design")],
+    });
+    projectApi.list.mockImplementation(async (workspaceId: number) => ({
+      projects: [{
+        id: workspaceId * 10,
+        workspace_id: workspaceId,
+        name: `Project ${workspaceId}`,
+        description: null,
+        created_at: "2026-10-11T00:00:00+00:00",
+        updated_at: "2026-10-11T00:00:00+00:00",
+      }],
+    }));
+
+    renderSwitcher();
+    const selector = await screen.findByLabelText("Current workspace");
+    await screen.findByRole("heading", { name: "Project 1" });
+    fireEvent.change(selector, { target: { value: "2" } });
+    await screen.findByRole("heading", { name: "Project 2" });
+
+    expect(taskApi.list).not.toHaveBeenCalledWith(2, 10);
+    expect(taskApi.listActivity).not.toHaveBeenCalledWith(2, 10);
+    expect(taskApi.list).toHaveBeenCalledWith(2, 20);
+  });
+
+
   it("opens the workspace, project, and task referenced by a notification", async () => {
     workspaceApi.list.mockResolvedValue({
       workspaces: [
@@ -207,5 +234,46 @@ describe("workspace selection", () => {
     );
     expect(await screen.findByLabelText("Select a project")).toHaveValue("20");
     expect(await screen.findByLabelText("Title")).toHaveValue("Follow up on assignment");
+  });
+
+  it("focuses the workspace decision CTA through the mounted switcher form", async () => {
+    workspaceApi.list.mockResolvedValue({ workspaces: [] });
+
+    renderSwitcher();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start workspace setup from overview" }));
+    await waitFor(() => expect(screen.getByLabelText("New workspace name")).toHaveFocus());
+    expect(workspaceApi.create).not.toHaveBeenCalled();
+  });
+
+  it("focuses the project decision CTA through the mounted project form", async () => {
+    workspaceApi.list.mockResolvedValue({ workspaces: [makeWorkspace(1, "Research")] });
+    projectApi.list.mockResolvedValue({ projects: [] });
+
+    renderSwitcher();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start project setup from overview" }));
+    await waitFor(() => expect(screen.getByLabelText("New project name")).toHaveFocus());
+    expect(projectApi.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the task decision CTA through the mounted task form", async () => {
+    workspaceApi.list.mockResolvedValue({ workspaces: [makeWorkspace(1, "Research")] });
+    projectApi.list.mockResolvedValue({
+      projects: [{
+        id: 10,
+        workspace_id: 1,
+        name: "Roadmap",
+        description: null,
+        created_at: "2026-10-11T00:00:00+00:00",
+        updated_at: "2026-10-11T00:00:00+00:00",
+      }],
+    });
+
+    renderSwitcher();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New task" }));
+    await waitFor(() => expect(screen.getByLabelText("New task")).toHaveFocus());
+    expect(taskApi.create).not.toHaveBeenCalled();
   });
 });

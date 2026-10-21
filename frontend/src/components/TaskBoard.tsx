@@ -13,11 +13,22 @@ import {
   type TaskAssignee,
 } from "../api/tasks";
 import type { Workspace } from "../api/workspaces";
+import { ConfirmDialog, PriorityBadge, StatusBadge } from "./Ui";
 
 interface TaskBoardProps {
   workspace: Workspace;
   projectId: number;
   initialTaskId?: number | null;
+  tasks?: Task[] | null;
+  tasksState?: { status: "idle" | "loading" | "success" | "error"; error: string | null };
+  assignees?: TaskAssignee[] | null;
+  selectedTaskId?: number | null;
+  onSelectTask?: (taskId: number | null) => void;
+  onTaskCreated?: (task: Task) => void;
+  onTaskUpdated?: (task: Task) => void;
+  onTaskDeleted?: (taskId: number) => void;
+  onRetryTasks?: () => void;
+  registerFocusTarget?: (target: "task-title", focus: () => void) => () => void;
 }
 
 const COLUMNS: { status: TaskStatus; label: string }[] = [
@@ -29,11 +40,24 @@ const COLUMNS: { status: TaskStatus; label: string }[] = [
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Tasks could not be loaded.";
 }
+function calendarKey(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
 
 export function TaskBoard({
   workspace,
   projectId,
   initialTaskId = null,
+  tasks: controlledTasks,
+  tasksState: controlledTasksState,
+  assignees: controlledAssignees,
+  selectedTaskId: controlledSelectedId,
+  onSelectTask,
+  onTaskCreated,
+  onTaskUpdated,
+  onTaskDeleted,
+  onRetryTasks,
+  registerFocusTarget,
 }: TaskBoardProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [assignees, setAssignees] = useState<TaskAssignee[]>([]);
@@ -45,6 +69,12 @@ export function TaskBoard({
   const [requestError, setRequestError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftDescription, setDraftDescription] = useState("");
+  const [draftDueDate, setDraftDueDate] = useState("");
+  const [draftTaskId, setDraftTaskId] = useState<number | null>(null);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState<string | null>(null);
   const [comments, setComments] = useState<TaskComment[]>([]);
   const [activity, setActivity] = useState<TaskActivity[]>([]);
   const [discussionLoading, setDiscussionLoading] = useState(false);
@@ -54,9 +84,33 @@ export function TaskBoard({
   const [commentSubmitting, setCommentSubmitting] = useState(false);
   const [editingCommentId, setEditingCommentId] = useState<number | null>(null);
   const [editingCommentBody, setEditingCommentBody] = useState("");
+  const [confirmation, setConfirmation] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    action: () => Promise<void>;
+  } | null>(null);
+  const isControlled = controlledTasks !== undefined && controlledTasksState !== undefined;
+  const visibleTasks = isControlled ? controlledTasks ?? [] : tasks;
+  const visibleAssignees = isControlled ? controlledAssignees ?? [] : assignees;
+  const visibleSelectedId = isControlled ? controlledSelectedId ?? null : selectedId;
+  const visibleLoading = isControlled ? controlledTasksState.status === "loading" : loading;
+  const visibleError = isControlled && controlledTasksState.status === "error"
+    ? controlledTasksState.error
+    : loadError;
+  const today = calendarKey(new Date());
+
+  const selectTask = (taskId: number | null) => {
+    if (isControlled) onSelectTask?.(taskId);
+    else setSelectedId(taskId);
+  };
   const canDelete = workspace.role === "owner" || workspace.role === "admin";
 
   const reload = useCallback(async () => {
+    if (isControlled) {
+      onRetryTasks?.();
+      return;
+    }
     setLoading(true);
     setLoadError(null);
     try {
@@ -71,9 +125,10 @@ export function TaskBoard({
     } finally {
       setLoading(false);
     }
-  }, [projectId, workspace.id]);
+  }, [isControlled, onRetryTasks, projectId, workspace.id]);
 
   useEffect(() => {
+    if (isControlled) return;
     let active = true;
     setTasks([]);
     setAssignees([]);
@@ -101,10 +156,29 @@ export function TaskBoard({
     };
   }, [initialTaskId, projectId, workspace.id]);
 
-  const selected = tasks.find((task) => task.id === selectedId) ?? null;
+  const selected = visibleTasks.find((task) => task.id === visibleSelectedId) ?? null;
+
+  useEffect(() => {
+    if (!selected) {
+      setDraftTaskId(null);
+      setDraftTitle("");
+      setDraftDescription("");
+      setDraftDueDate("");
+      setDraftError(null);
+      setSaveSuccess(null);
+      return;
+    }
+    if (draftTaskId === selected.id) return;
+    setDraftTaskId(selected.id);
+    setDraftTitle(selected.title);
+    setDraftDescription(selected.description ?? "");
+    setDraftDueDate(selected.due_date ?? "");
+    setDraftError(null);
+    setSaveSuccess(null);
+  }, [draftTaskId, selected]);
 
   const loadDiscussion = useCallback(async () => {
-    if (!selectedId) {
+    if (!visibleSelectedId) {
       setComments([]);
       setActivity([]);
       return;
@@ -113,8 +187,8 @@ export function TaskBoard({
     setDiscussionError(null);
     try {
       const [commentResult, activityResult] = await Promise.all([
-        taskApi.listComments(workspace.id, projectId, selectedId),
-        taskApi.listActivity(workspace.id, projectId, selectedId),
+        taskApi.listComments(workspace.id, projectId, visibleSelectedId),
+        taskApi.listActivity(workspace.id, projectId, visibleSelectedId),
       ]);
       setComments(commentResult.comments);
       setActivity(activityResult.activities);
@@ -123,11 +197,11 @@ export function TaskBoard({
     } finally {
       setDiscussionLoading(false);
     }
-  }, [projectId, selectedId, workspace.id]);
+  }, [projectId, visibleSelectedId, workspace.id]);
 
   useEffect(() => {
     let active = true;
-    if (!selectedId) {
+    if (!visibleSelectedId) {
       setComments([]);
       setActivity([]);
       setDiscussionError(null);
@@ -138,8 +212,8 @@ export function TaskBoard({
     setDiscussionLoading(true);
     setDiscussionError(null);
     void Promise.all([
-      taskApi.listComments(workspace.id, projectId, selectedId),
-      taskApi.listActivity(workspace.id, projectId, selectedId),
+      taskApi.listComments(workspace.id, projectId, visibleSelectedId),
+      taskApi.listActivity(workspace.id, projectId, visibleSelectedId),
     ])
       .then(([commentResult, activityResult]) => {
         if (!active) return;
@@ -155,7 +229,7 @@ export function TaskBoard({
     return () => {
       active = false;
     };
-  }, [projectId, selectedId, workspace.id]);
+  }, [projectId, visibleSelectedId, workspace.id]);
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -176,8 +250,13 @@ export function TaskBoard({
       const result = await taskApi.create(workspace.id, projectId, {
         title: normalizedTitle,
       });
-      setTasks((current) => [...current, result.task]);
-      setSelectedId(result.task.id);
+      if (isControlled) {
+        onTaskCreated?.(result.task);
+        onSelectTask?.(result.task.id);
+      } else {
+        setTasks((current) => [...current, result.task]);
+        setSelectedId(result.task.id);
+      }
       setTitle("");
     } catch (error) {
       if (error instanceof ApiError && error.fields?.title) {
@@ -201,14 +280,56 @@ export function TaskBoard({
         selected.id,
         input,
       );
-      setTasks((current) =>
-        current.map((task) => (task.id === result.task.id ? result.task : task)),
-      );
+      if (isControlled) onTaskUpdated?.(result.task);
+      else {
+        setTasks((current) =>
+          current.map((task) => (task.id === result.task.id ? result.task : task)),
+        );
+      }
     } catch (error) {
       setRequestError(errorMessage(error));
     } finally {
       setSaving(false);
     }
+  }
+
+  async function saveDraft() {
+    if (!selected) return;
+    const titleValue = draftTitle.trim();
+    if (!titleValue) { setDraftError("Enter a task title."); return; }
+    if (titleValue.length > 200) { setDraftError("Task titles must be 200 characters or fewer."); return; }
+    if (draftDueDate && !/^\d{4}-\d{2}-\d{2}$/.test(draftDueDate)) { setDraftError("Enter a valid due date."); return; }
+    const input: Partial<TaskInput> = {};
+    if (titleValue !== selected.title) input.title = titleValue;
+    if (draftDescription !== (selected.description ?? "")) input.description = draftDescription || null;
+    const dueDate = draftDueDate || null;
+    if (dueDate !== selected.due_date) input.due_date = dueDate;
+    if (Object.keys(input).length === 0) { setDraftError(null); return; }
+    setDraftError(null);
+    setRequestError(null);
+    setSaveSuccess(null);
+    setSaving(true);
+    try {
+      const result = await taskApi.update(workspace.id, projectId, selected.id, input);
+      if (isControlled) onTaskUpdated?.(result.task);
+      else setTasks((current) => current.map((task) => task.id === result.task.id ? result.task : task));
+      setDraftTaskId(result.task.id);
+      setDraftTitle(result.task.title);
+      setDraftDescription(result.task.description ?? "");
+      setDraftDueDate(result.task.due_date ?? "");
+      setSaveSuccess("Task changes saved.");
+    } catch (error) {
+      setDraftError(errorMessage(error));
+    } finally { setSaving(false); }
+  }
+
+  function cancelDraft() {
+    if (!selected) return;
+    setDraftTitle(selected.title);
+    setDraftDescription(selected.description ?? "");
+    setDraftDueDate(selected.due_date ?? "");
+    setDraftError(null);
+    setSaveSuccess(null);
   }
 
   async function deleteSelected() {
@@ -217,8 +338,13 @@ export function TaskBoard({
     setSaving(true);
     try {
       await taskApi.delete(workspace.id, projectId, selected.id);
-      setTasks((current) => current.filter((task) => task.id !== selected.id));
-      setSelectedId(null);
+      if (isControlled) {
+        onTaskDeleted?.(selected.id);
+        onSelectTask?.(null);
+      } else {
+        setTasks((current) => current.filter((task) => task.id !== selected.id));
+        setSelectedId(null);
+      }
     } catch (error) {
       setRequestError(errorMessage(error));
     } finally {
@@ -292,6 +418,24 @@ export function TaskBoard({
     }
   }
 
+  function requestDeleteSelected() {
+    if (!selected) return;
+    setConfirmation({
+      title: "Delete task?",
+      message: "This task and its discussion will be permanently removed.",
+      confirmLabel: "Delete task",
+      action: deleteSelected,
+    });
+  }
+
+  function requestDeleteComment(comment: TaskComment) {
+    setConfirmation({
+      title: "Delete comment?",
+      message: "This comment will be permanently removed.",
+      confirmLabel: "Delete comment",
+      action: () => deleteComment(comment),
+    });
+  }
   function activityDescription(item: TaskActivity) {
     const actor = item.actor?.name ?? "A former user";
     const messages: Record<TaskActivity["event_type"], string> = {
@@ -319,9 +463,9 @@ export function TaskBoard({
         </button>
       </div>
 
-      {loadError && (
+      {visibleError && (
         <div>
-          <p className="error-banner" role="alert">{loadError}</p>
+          <p className="error-banner" role="alert">{visibleError}</p>
           <button className="quiet-button" onClick={() => void reload()} type="button">
             Try again
           </button>
@@ -332,6 +476,12 @@ export function TaskBoard({
       <form className="task-create-form" onSubmit={handleCreate} noValidate>
         <label htmlFor="task-title">New task</label>
         <input
+          ref={(element) => {
+            if (element && registerFocusTarget) {
+              return registerFocusTarget("task-title", () => element.focus());
+            }
+            return undefined;
+          }}
           id="task-title"
           value={title}
           maxLength={200}
@@ -340,18 +490,18 @@ export function TaskBoard({
           aria-describedby={createError ? "task-title-error" : undefined}
         />
         {createError && <p className="field-error" id="task-title-error">{createError}</p>}
-        <button className="primary-button" disabled={submitting} type="submit">
+        <button className="quiet-button" disabled={submitting} type="submit">
           {submitting ? "Creating task…" : "Create task"}
         </button>
       </form>
 
-      {loading ? (
+      {visibleLoading ? (
         <p role="status">Loading tasks…</p>
-      ) : !loadError ? (
+      ) : !visibleError ? (
         <>
           <div className="task-columns">
             {COLUMNS.map((column) => {
-              const columnTasks = tasks.filter((task) => task.status === column.status);
+              const columnTasks = visibleTasks.filter((task) => task.status === column.status);
               return (
                 <section
                   className="task-column"
@@ -364,13 +514,15 @@ export function TaskBoard({
                   ) : (
                     columnTasks.map((task) => (
                       <button
-                        className={`task-card${selectedId === task.id ? " selected" : ""}`}
+                        className={`task-card${visibleSelectedId === task.id ? " selected" : ""}`}
                         key={task.id}
-                        onClick={() => setSelectedId(task.id)}
+                        onClick={() => selectTask(task.id)}
                         type="button"
                       >
                         <strong>{task.title}</strong>
-                        <span className={`priority-${task.priority}`}>{task.priority}</span>
+                        <PriorityBadge value={task.priority} />
+                        <StatusBadge value={task.status} />
+                        {task.due_date && <small className={task.due_date < today ? "task-overdue" : ""}>{task.due_date}{task.due_date < today ? " · Overdue" : ""}</small>}
                         {task.assignee && <small>Assigned to {task.assignee.name}</small>}
                       </button>
                     ))
@@ -379,7 +531,7 @@ export function TaskBoard({
               );
             })}
           </div>
-          {tasks.length === 0 && (
+          {visibleTasks.length === 0 && (
             <p className="workspace-empty">No tasks yet. Add a task to start the board.</p>
           )}
         </>
@@ -391,25 +543,23 @@ export function TaskBoard({
           <label htmlFor="edit-task-title">Title</label>
           <input
             id="edit-task-title"
-            key={selected.id}
-            defaultValue={selected.title}
+            value={draftTaskId === selected.id ? draftTitle : selected.title}
             maxLength={200}
-            onBlur={(event) => {
-              if (event.target.value.trim() !== selected.title) {
-                void updateSelected({ title: event.target.value });
-              }
+            disabled={saving}
+            onChange={(event) => {
+              setDraftTitle(event.target.value);
+              setSaveSuccess(null);
             }}
           />
           <label htmlFor="edit-task-description">Description</label>
           <textarea
             id="edit-task-description"
-            key={`${selected.id}-description`}
-            defaultValue={selected.description ?? ""}
+            value={draftTaskId === selected.id ? draftDescription : (selected.description ?? "")}
             maxLength={2000}
-            onBlur={(event) => {
-              if (event.target.value !== (selected.description ?? "")) {
-                void updateSelected({ description: event.target.value || null });
-              }
+            disabled={saving}
+            onChange={(event) => {
+              setDraftDescription(event.target.value);
+              setSaveSuccess(null);
             }}
           />
           <label htmlFor="edit-task-status">Status</label>
@@ -448,7 +598,7 @@ export function TaskBoard({
             }
           >
             <option value="">Unassigned</option>
-            {assignees.map((assignee) => (
+            {visibleAssignees.map((assignee) => (
               <option key={assignee.id} value={assignee.id}>{assignee.name}</option>
             ))}
           </select>
@@ -456,20 +606,24 @@ export function TaskBoard({
           <input
             id="edit-task-due-date"
             type="date"
-            key={`${selected.id}-due-date`}
-            defaultValue={selected.due_date ?? ""}
-            onBlur={(event) => {
-              const nextDate = event.target.value || null;
-              if (nextDate !== selected.due_date) {
-                void updateSelected({ due_date: nextDate });
-              }
+            value={draftTaskId === selected.id ? draftDueDate : (selected.due_date ?? "")}
+            disabled={saving}
+            onChange={(event) => {
+              setDraftDueDate(event.target.value);
+              setSaveSuccess(null);
             }}
           />
+          {draftError && <p className="field-error" role="alert">{draftError}</p>}
+          {saveSuccess && <p className="success-banner" role="status" aria-live="polite">{saveSuccess}</p>}
+          <div className="task-draft-actions">
+            <button className="quiet-button" disabled={saving} onClick={() => void saveDraft()} type="button">{saving ? "Saving…" : "Save changes"}</button>
+            <button className="quiet-button" disabled={saving} onClick={cancelDraft} type="button">Cancel changes</button>
+          </div>
           {canDelete && (
             <button
               className="quiet-button danger-button"
               disabled={saving}
-              onClick={() => void deleteSelected()}
+              onClick={requestDeleteSelected}
               type="button"
             >
               Delete task
@@ -551,7 +705,7 @@ export function TaskBoard({
                     </button>
                     <button
                       className="quiet-button danger-button"
-                      onClick={() => void deleteComment(comment)}
+                      onClick={() => requestDeleteComment(comment)}
                       type="button"
                     >
                       Delete
@@ -575,7 +729,7 @@ export function TaskBoard({
                   <p className="field-error" id="task-comment-error">{commentError}</p>
                 )}
                 <button
-                  className="primary-button"
+                  className="quiet-button"
                   disabled={commentSubmitting}
                   type="submit"
                 >
@@ -600,6 +754,18 @@ export function TaskBoard({
           </section>
         </section>
       )}
+      <ConfirmDialog
+        open={confirmation !== null}
+        title={confirmation?.title ?? "Confirm action"}
+        confirmLabel={confirmation?.confirmLabel}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={() => {
+          if (!confirmation) return;
+          void confirmation.action().finally(() => setConfirmation(null));
+        }}
+      >
+        <p>{confirmation?.message}</p>
+      </ConfirmDialog>
     </section>
   );
 }
